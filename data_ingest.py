@@ -66,6 +66,7 @@ def download_odds_data() -> pd.DataFrame:
                         headers={"User-Agent": "Mozilla/5.0"})
     resp.raise_for_status()
     odds = pd.read_excel(BytesIO(resp.content), header=1)
+    print(f"  Odds columns: {odds.columns.tolist()[:20]}...")
 
     # Normalize
     odds["date"] = pd.to_datetime(odds["Date"]).dt.normalize()
@@ -83,18 +84,33 @@ def download_odds_data() -> pd.DataFrame:
     for old, new in odds_cols.items():
         if old in odds.columns:
             odds[new] = odds[old]
-
+    
+    if "is_final" in odds.columns:
+        odds["is_final"] = (
+            odds["is_final"].replace({"Y": 1}).fillna(0).astype(int)
+        )
+    else:
+        odds["is_final"] = 0
+    
     keep = ["date", "home_team", "away_team"] + list(odds_cols.values())
-    return odds[[c for c in keep if c in odds.columns]].copy()
-
+    odds = odds[[c for c in keep if c in odds.columns]].copy()
+    return odds
+        
 
 def merge_data(matches: pd.DataFrame, odds: pd.DataFrame) -> pd.DataFrame:
     """Merge match results with odds on (date, home_team, away_team)."""
+    print(f"  Matches: {len(matches)}, Odds: {len(odds)}")
     merged = matches.merge(
         odds,
         on=["date", "home_team", "away_team"],
         how="inner",
     )
+    print(f"  Merged: {len(merged)}")
+    if len(merged) == 0:
+        print("  WARNING: Merge resulted in 0 rows!")
+        print(f"  Matches teams: {matches['home_team'].unique()[:5]}")
+        print(f"  Odds teams: {odds['home_team'].unique()[:5]}")
+        return merged
 
     # Convert odds to implied probabilities
     merged["implied_prob_home"] = 1.0 / merged["odds_home"]

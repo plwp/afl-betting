@@ -64,21 +64,52 @@ TEST_START = 2023     # test: 2023-2024
 TEST_END = 2024
 
 # --- Betting Parameters ---
-KELLY_FRACTION = 0.25
-MAX_BET_FRACTION = 0.05  # max 5% of bankroll
+KELLY_FRACTION = 0.15
+MAX_BET_FRACTION = 0.03  # max 3% of bankroll
 MIN_STAKE = 5.0
-EDGE_THRESHOLD = 0.03    # minimum 3% edge to bet
+EDGE_THRESHOLD = 0.05    # minimum 5% edge to bet
 INITIAL_BANKROLL = 1000.0
+
+# --- Team-to-State Mappings ---
+TEAM_STATE = {
+    "Adelaide": "SA", "Port Adelaide": "SA",
+    "Brisbane": "QLD", "Gold Coast": "QLD",
+    "Fremantle": "WA", "West Coast": "WA",
+    "Sydney": "NSW", "GWS Giants": "NSW",
+    "Carlton": "VIC", "Collingwood": "VIC", "Essendon": "VIC",
+    "Geelong": "VIC", "Hawthorn": "VIC", "Melbourne": "VIC",
+    "North Melbourne": "VIC", "Richmond": "VIC", "St Kilda": "VIC",
+    "Western Bulldogs": "VIC",
+}
+
+# --- Venue-to-State Mappings ---
+VENUE_STATE = {
+    "M.C.G.": "VIC", "Docklands": "VIC", "Kardinia Park": "VIC",
+    "Eureka Stadium": "VIC",
+    "S.C.G.": "NSW", "Stadium Australia": "NSW", "Blacktown": "NSW",
+    "Sydney Showground": "NSW",
+    "Subiaco": "WA", "Perth Stadium": "WA",
+    "Football Park": "SA", "Adelaide Oval": "SA", "Norwood Oval": "SA",
+    "Summit Sports Park": "SA",
+    "Gabba": "QLD", "Carrara": "QLD", "Cazaly's Stadium": "QLD",
+    "Riverway Stadium": "QLD",
+    "York Park": "TAS", "Bellerive Oval": "TAS",
+    "Manuka Oval": "ACT",
+    "Marrara Oval": "NT", "Traeger Park": "NT",
+}
 
 # --- Feature Columns ---
 FEATURE_COLS = [
     "elo_diff", "elo_prob",
+    "market_prob_home", "elo_market_diff",
+    "is_home_state_home", "is_home_state_away",
+    "travel_dist_home", "travel_dist_away",
     "form_home_5", "form_away_5", "form_diff",
     "win_pct_home_10", "win_pct_away_10",
     "venue_exp_home", "venue_exp_away",
     "rest_days_home", "rest_days_away", "rest_diff",
     "h2h_home_win_pct",
-    "season_round",
+    "season_round", "is_final",
     "margin_ewma_home", "margin_ewma_away",
     "scoring_ewma_home", "scoring_ewma_away",
 ]

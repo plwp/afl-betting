@@ -6,7 +6,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.frozen import FrozenEstimator
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 import lightgbm as lgb
 
 from config import (
@@ -35,45 +36,71 @@ def walk_forward_backtest(df: pd.DataFrame,
     bankroll_history = [(df[df["year"] == start_year]["date"].min(), bankroll)]
 
     for year in range(start_year, end_year + 1):
-        train_data = df[df["year"] <= year - 2]
-        cal_data = df[df["year"] == year - 1]
+        train_full = df[df["year"] < year]
         test_data = df[df["year"] == year]
 
-        if len(train_data) < 100 or len(cal_data) < 20 or len(test_data) == 0:
+        if len(train_full) < 100 or len(test_data) == 0:
             print(f"  Skipping {year}: insufficient data")
             continue
 
-        X_train = train_data[FEATURE_COLS]
-        y_train = train_data["home_win"].values
-        X_cal = cal_data[FEATURE_COLS]
-        y_cal = cal_data["home_win"].values
+        X_train = train_full[FEATURE_COLS]
+        y_train = train_full["home_win"].values
 
-        # Train LightGBM
-        model = lgb.LGBMClassifier(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=6,
-            num_leaves=31,
+        # Scale for LogReg
+        scaler = StandardScaler()
+        X_train_sc = scaler.fit_transform(X_train)
+
+        # Train models with internal CV for calibration (more stable)
+        lr = LogisticRegression(max_iter=1000, C=1.0)
+        cal_lr = CalibratedClassifierCV(lr, method="sigmoid", cv=5)
+        
+        lgb_model = lgb.LGBMClassifier(
+            n_estimators=200,
+            learning_rate=0.03,
+            max_depth=3,
+            num_leaves=7,
             subsample=0.8,
             colsample_bytree=0.8,
-            min_child_samples=20,
+            min_child_samples=50,
             random_state=42,
             verbose=-1,
         )
-        model.fit(X_train, y_train)
+        cal_lgb = CalibratedClassifierCV(lgb_model, method="sigmoid", cv=5)
 
-        # Calibrate
-        cal_model = CalibratedClassifierCV(FrozenEstimator(model), method="isotonic")
-        cal_model.fit(X_cal, y_cal)
+        cal_lr.fit(X_train_sc, y_train)
+        cal_lgb.fit(X_train, y_train)
 
         # Predict on test year
         X_test = test_data[FEATURE_COLS]
-        probs = cal_model.predict_proba(X_test)[:, 1]
+        X_test_sc = scaler.transform(X_test)
+        
+        lr_probs = cal_lr.predict_proba(X_test_sc)[:, 1]
+        lgb_probs = cal_lgb.predict_proba(X_test)[:, 1]
+        
+        # 70/30 ensemble as determined in model research
+        probs = 0.7 * lr_probs + 0.3 * lgb_probs
 
         year_bets = 0
         year_pnl = 0
+        
+        # Track bankroll at start of day to prevent over-betting concurrent games
+        current_date = None
+        daily_start_bankroll = bankroll
+        pending_pnl = 0
 
         for i, (idx, row) in enumerate(test_data.iterrows()):
+            if bankroll < MIN_STAKE:
+                print(f"  BANKRUPT in {year}!")
+                break
+                
+            # Date change: apply previous day's P&L and reset start bankroll
+            if current_date is not None and row["date"] != current_date:
+                bankroll += pending_pnl
+                daily_start_bankroll = bankroll
+                pending_pnl = 0
+            
+            current_date = row["date"]
+            
             prob_home = probs[i]
             prob_away = 1 - prob_home
             odds_home = row.get("odds_home", None)
@@ -83,45 +110,35 @@ def walk_forward_backtest(df: pd.DataFrame,
             if odds_home is not None and not np.isnan(odds_home):
                 e_home = edge(prob_home, odds_home)
                 if e_home > edge_threshold:
-                    stake = kelly_stake(prob_home, odds_home, bankroll)
+                    stake = kelly_stake(prob_home, odds_home, daily_start_bankroll)
                     if stake > 0:
                         won = row["home_win"] == 1
                         pnl = stake * (odds_home - 1) if won else -stake
-                        bankroll += pnl
+                        pending_pnl += pnl
                         year_pnl += pnl
                         year_bets += 1
-                        # CLV: closing line value
                         odds_close = row.get("odds_home_close", odds_home)
                         if pd.isna(odds_close):
                             odds_close = odds_home
                         clv = (1 / odds_close) - (1 / odds_home)
                         bet_log.append({
-                            "date": row["date"],
-                            "year": year,
-                            "home_team": row["home_team"],
-                            "away_team": row["away_team"],
-                            "side": "home",
-                            "model_prob": prob_home,
-                            "odds": odds_home,
-                            "odds_close": odds_close,
-                            "edge": e_home,
-                            "stake": stake,
-                            "won": won,
-                            "pnl": pnl,
-                            "clv": clv,
-                            "bankroll": bankroll,
+                            "date": row["date"], "year": year,
+                            "home_team": row["home_team"], "away_team": row["away_team"],
+                            "side": "home", "model_prob": prob_home, "odds": odds_home,
+                            "odds_close": odds_close, "edge": e_home, "stake": stake,
+                            "won": won, "pnl": pnl, "clv": clv, "bankroll": bankroll + pending_pnl,
                         })
-                        bankroll_history.append((row["date"], bankroll))
+                        bankroll_history.append((row["date"], bankroll + pending_pnl))
 
             # Try away bet
             if odds_away is not None and not np.isnan(odds_away):
                 e_away = edge(prob_away, odds_away)
                 if e_away > edge_threshold:
-                    stake = kelly_stake(prob_away, odds_away, bankroll)
+                    stake = kelly_stake(prob_away, odds_away, daily_start_bankroll)
                     if stake > 0:
                         won = row["home_win"] == 0
                         pnl = stake * (odds_away - 1) if won else -stake
-                        bankroll += pnl
+                        pending_pnl += pnl
                         year_pnl += pnl
                         year_bets += 1
                         odds_close = row.get("odds_away_close", odds_away)
@@ -129,22 +146,16 @@ def walk_forward_backtest(df: pd.DataFrame,
                             odds_close = odds_away
                         clv = (1 / odds_close) - (1 / odds_away)
                         bet_log.append({
-                            "date": row["date"],
-                            "year": year,
-                            "home_team": row["home_team"],
-                            "away_team": row["away_team"],
-                            "side": "away",
-                            "model_prob": prob_away,
-                            "odds": odds_away,
-                            "odds_close": odds_close,
-                            "edge": e_away,
-                            "stake": stake,
-                            "won": won,
-                            "pnl": pnl,
-                            "clv": clv,
-                            "bankroll": bankroll,
+                            "date": row["date"], "year": year,
+                            "home_team": row["home_team"], "away_team": row["away_team"],
+                            "side": "away", "model_prob": prob_away, "odds": odds_away,
+                            "odds_close": odds_close, "edge": e_away, "stake": stake,
+                            "won": won, "pnl": pnl, "clv": clv, "bankroll": bankroll + pending_pnl,
                         })
-                        bankroll_history.append((row["date"], bankroll))
+                        bankroll_history.append((row["date"], bankroll + pending_pnl))
+
+        # End of year: apply any pending P&L
+        bankroll += pending_pnl
 
         print(f"  {year}: {year_bets} bets, P&L ${year_pnl:+.2f}, "
               f"Bankroll ${bankroll:.2f}")

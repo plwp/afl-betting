@@ -94,64 +94,66 @@ def train_models(df: pd.DataFrame = None):
     evaluate(y_val, lr_val_prob, "LogReg (Val)", val["market_prob_home"].values)
     evaluate(y_test, lr_test_prob, "LogReg (Test)", test["market_prob_home"].values)
 
-    # --- LightGBM ---
+    # --- Ensemble Model ---
+    # We use a simple average of calibrated LogReg and calibrated LightGBM
+    from sklearn.ensemble import VotingClassifier
+
+    lr = LogisticRegression(max_iter=1000, C=1.0)
     lgb_model = lgb.LGBMClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=6,
-        num_leaves=31,
+        n_estimators=200,
+        learning_rate=0.03,
+        max_depth=3,
+        num_leaves=7,
         subsample=0.8,
         colsample_bytree=0.8,
-        min_child_samples=20,
+        min_child_samples=50,
         random_state=42,
         verbose=-1,
     )
-    lgb_model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        callbacks=[lgb.log_evaluation(0)],
-    )
 
-    lgb_val_prob = lgb_model.predict_proba(X_val)[:, 1]
-    lgb_test_prob = lgb_model.predict_proba(X_test)[:, 1]
+    # Use CalibratedClassifierCV with CV (default 5-fold)
+    # This is more stable as it uses more data for calibration
+    cal_lr = CalibratedClassifierCV(lr, method="sigmoid", cv=5)
+    cal_lgb = CalibratedClassifierCV(lgb_model, method="sigmoid", cv=5)
 
-    evaluate(y_val, lgb_val_prob, "LightGBM (Val)", val["market_prob_home"].values)
-    evaluate(y_test, lgb_test_prob, "LightGBM (Test)", test["market_prob_home"].values)
+    # Combine X_train and X_val for a larger calibration/training set
+    X_train_full = pd.concat([X_train, X_val])
+    y_train_full = np.concatenate([y_train, y_val])
+    
+    # Scale for LogReg
+    X_train_full_sc = scaler.fit_transform(X_train_full)
+    X_test_sc = scaler.transform(X_test)
 
-    # --- Calibration (isotonic on validation set) ---
-    # Calibrate LightGBM
-    cal_lgb = CalibratedClassifierCV(FrozenEstimator(lgb_model), method="isotonic")
-    cal_lgb.fit(X_val, y_val)
+    print("Training Calibrated LogReg...")
+    cal_lr.fit(X_train_full_sc, y_train_full)
+    print("Training Calibrated LightGBM...")
+    cal_lgb.fit(X_train_full, y_train_full)
 
-    cal_test_prob = cal_lgb.predict_proba(X_test)[:, 1]
-    evaluate(y_test, cal_test_prob, "Calibrated LightGBM (Test)",
-             test["market_prob_home"].values)
+    lr_prob = cal_lr.predict_proba(X_test_sc)[:, 1]
+    lgb_prob = cal_lgb.predict_proba(X_test)[:, 1]
+    
+    # Ensemble: 70% LogReg, 30% LightGBM (LogReg is more robust here)
+    ensemble_prob = 0.7 * lr_prob + 0.3 * lgb_prob
+    
+    evaluate(y_test, lr_prob, "Calibrated LogReg (Test)", test["market_prob_home"].values)
+    evaluate(y_test, lgb_prob, "Calibrated LightGBM (Test)", test["market_prob_home"].values)
+    evaluate(y_test, ensemble_prob, "Ensemble (Test)", test["market_prob_home"].values)
 
     # Calibration plots
-    plot_calibration(y_test, lgb_test_prob, "LightGBM Raw",
-                     os.path.join(MODEL_DIR, "calibration_lgb_raw.png"))
-    plot_calibration(y_test, cal_test_prob, "LightGBM Calibrated",
-                     os.path.join(MODEL_DIR, "calibration_lgb_cal.png"))
-
-    # --- Feature Importance ---
-    importance = pd.Series(
-        lgb_model.feature_importances_, index=FEATURE_COLS
-    ).sort_values(ascending=False)
-    print("\nFeature Importance (LightGBM):")
-    print(importance.to_string())
+    plot_calibration(y_test, ensemble_prob, "Ensemble",
+                     os.path.join(MODEL_DIR, "calibration_ensemble.png"))
 
     # --- Save ---
     joblib.dump(scaler, os.path.join(MODEL_DIR, "scaler.pkl"))
-    joblib.dump(lr, os.path.join(MODEL_DIR, "logreg.pkl"))
-    joblib.dump(lgb_model, os.path.join(MODEL_DIR, "lgb_raw.pkl"))
-    joblib.dump(cal_lgb, os.path.join(MODEL_DIR, "lgb_calibrated.pkl"))
+    joblib.dump(cal_lr, os.path.join(MODEL_DIR, "logreg_cal.pkl"))
+    joblib.dump(cal_lgb, os.path.join(MODEL_DIR, "lgb_cal.pkl"))
     print(f"\nModels saved to {MODEL_DIR}/")
 
     return {
         "scaler": scaler,
-        "logreg": lr,
-        "lgb_raw": lgb_model,
-        "lgb_calibrated": cal_lgb,
+        "logreg_cal": cal_lr,
+        "lgb_cal": cal_lgb,
+        "ensemble_prob": ensemble_prob
     }
 
 

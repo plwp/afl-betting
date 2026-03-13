@@ -48,9 +48,16 @@ def build_elo(df: pd.DataFrame) -> pd.DataFrame:
         exp_home = _elo_expected(r_home + ELO_HOME_ADV, r_away)
         actual_home = 1.0 if row["margin"] > 0 else (0.5 if row["margin"] == 0 else 0.0)
 
+        # Margin-based K multiplier
+        margin = abs(row["margin"])
+        # For AFL, a winning margin of ~30-40 is 'typical'.
+        # We use a log-scaled margin to prevent blowouts from overly biasing Elo.
+        k_multiplier = np.log1p(margin) * (2.2 / ((r_home - r_away) * 0.001 + 2.2))
+        k = ELO_K * k_multiplier
+
         # Update
-        ratings[home] = r_home + ELO_K * (actual_home - exp_home)
-        ratings[away] = r_away + ELO_K * ((1 - actual_home) - (1 - exp_home))
+        ratings[home] = r_home + k * (actual_home - exp_home)
+        ratings[away] = r_away + k * ((1 - actual_home) - (1 - exp_home))
 
     df = df.copy()
     df["elo_home"] = elo_home_list
@@ -60,6 +67,8 @@ def build_elo(df: pd.DataFrame) -> pd.DataFrame:
         lambda r: _elo_expected(r["elo_home"] + ELO_HOME_ADV, r["elo_away"]),
         axis=1,
     )
+    # New: diff from market
+    df["elo_market_diff"] = df["elo_prob"] - df["market_prob_home"]
     return df
 
 
@@ -131,17 +140,42 @@ def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     # --- H2H ---
-    # For each match, compute home team's historical win rate vs away team
+    # For each match, compute home team's historical win rate vs away team (any venue)
     h2h_records = {}
     h2h_col = []
     for _, row in df.iterrows():
         h, a = row["home_team"], row["away_team"]
-        key = (h, a)
-        wins, total = h2h_records.get(key, (0, 0))
-        h2h_col.append(wins / total if total > 0 else 0.5)
-        # Update after recording
-        result = 1 if row["home_win"] == 1 else 0
-        h2h_records[key] = (wins + result, total + 1)
+        # Use a sorted tuple to track H2H regardless of who is home
+        teams_key = tuple(sorted([h, a]))
+        wins, total = h2h_records.get(teams_key, (0, 0))
+        
+        # We want the win rate of the home_team against the away_team
+        # If total is 0, use 0.5
+        if total > 0:
+            # We need to know which team in the key is the 'home_team'
+            # Let's store wins as (count of team1 wins, count of team2 wins)
+            # but that's complex. Let's just store a simple dict of dicts.
+            pass
+            
+    # Redoing H2H more cleanly:
+    h2h_stats = {} # (teamA, teamB) -> [wins_A, total]
+    h2h_col = []
+    for _, row in df.iterrows():
+        h, a = row["home_team"], row["away_team"]
+        
+        # Get stats for h vs a
+        stats = h2h_stats.get((h, a), [0, 0])
+        rev_stats = h2h_stats.get((a, h), [0, 0])
+        
+        total_vs = stats[1] + rev_stats[1]
+        wins_vs = stats[0] + (rev_stats[1] - rev_stats[0]) # h's wins = (h as home wins) + (a as home losses)
+        
+        h2h_col.append(wins_vs / total_vs if total_vs > 0 else 0.5)
+        
+        # Update records
+        res = 1 if row["home_win"] == 1 else (0.5 if row["margin"] == 0 else 0)
+        curr = h2h_stats.get((h, a), [0, 0])
+        h2h_stats[(h, a)] = [curr[0] + res, curr[1] + 1]
 
     df["h2h_home_win_pct"] = h2h_col
 
@@ -170,7 +204,40 @@ def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     df["form_diff"] = df["form_home_5"] - df["form_away_5"]
     df["rest_diff"] = df["rest_days_home"] - df["rest_days_away"]
 
-    # Convert round_num to numeric (finals get round 25+)
+    # --- Travel and State ---
+    from config import TEAM_STATE, VENUE_STATE
+    
+    # State-to-state flight time approximation (hours)
+    # Simple lookup for dist between team state and venue state
+    # (Default 1.0)
+    FLIGHT_TIMES = {
+        ("VIC", "SA"): 1.0, ("VIC", "NSW"): 1.0, ("VIC", "TAS"): 1.0, 
+        ("VIC", "QLD"): 2.0, ("VIC", "WA"): 4.0, ("VIC", "NT"): 3.0,
+        ("SA", "VIC"): 1.0, ("SA", "NSW"): 1.5, ("SA", "QLD"): 2.5, ("SA", "WA"): 3.0,
+        ("WA", "VIC"): 4.0, ("WA", "SA"): 3.0, ("WA", "NSW"): 4.5, ("WA", "QLD"): 5.0,
+        ("NSW", "VIC"): 1.0, ("NSW", "SA"): 1.5, ("NSW", "QLD"): 1.5, ("NSW", "WA"): 4.5,
+        ("QLD", "VIC"): 2.0, ("QLD", "SA"): 2.5, ("QLD", "NSW"): 1.5, ("QLD", "WA"): 5.0,
+    }
+
+    def get_travel_dist(team, venue):
+        ts = TEAM_STATE.get(team)
+        vs = VENUE_STATE.get(venue)
+        if not ts or not vs: return 1.0
+        if ts == vs: return 0.0
+        return FLIGHT_TIMES.get((ts, vs), 1.5)
+
+    df["is_home_state_home"] = df.apply(
+        lambda r: 1 if TEAM_STATE.get(r["home_team"]) == VENUE_STATE.get(r["venue"]) else 0,
+        axis=1
+    )
+    df["is_home_state_away"] = df.apply(
+        lambda r: 1 if TEAM_STATE.get(r["away_team"]) == VENUE_STATE.get(r["venue"]) else 0,
+        axis=1
+    )
+    df["travel_dist_home"] = df.apply(lambda r: get_travel_dist(r["home_team"], r["venue"]), axis=1)
+    df["travel_dist_away"] = df.apply(lambda r: get_travel_dist(r["away_team"], r["venue"]), axis=1)
+
+    # Convert round_num to numeric
     finals_map = {
         "Elimination Final": 25,
         "Qualifying Final": 25,
@@ -178,9 +245,15 @@ def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
         "Preliminary Final": 27,
         "Grand Final": 28,
     }
-    df["season_round"] = df["round_num"].map(
-        lambda x: finals_map.get(x, int(x) if str(x).isdigit() else 25)
-    )
+    def clean_round(x):
+        if str(x).isdigit(): return int(x)
+        # Handle "Round X"
+        if "Round" in str(x):
+            try: return int(str(x).split()[-1])
+            except: pass
+        return finals_map.get(x, 25)
+
+    df["season_round"] = df["round_num"].map(clean_round)
 
     return df
 
