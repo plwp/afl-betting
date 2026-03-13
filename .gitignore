@@ -1,0 +1,7 @@
+data/
+models/
+.env
+bets.db
+__pycache__/
+*.pyc
+.odds_cache/
