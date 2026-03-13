@@ -1,34 +1,132 @@
-"""Feature engineering: Elo ratings, rolling stats, venue/rest features."""
+"""Feature engineering: Elo ratings, rolling stats, venue/rest/travel features."""
 
 import numpy as np
 import pandas as pd
+
 from config import (
-    ELO_K, ELO_HOME_ADV, ELO_INIT, ELO_SEASON_REVERT,
-    FEATURE_PATH, MERGED_PATH, FEATURE_COLS,
+    ELO_HOME_ADV,
+    ELO_INIT,
+    ELO_K,
+    ELO_MARGIN_K_CAP,
+    ELO_SEASON_REVERT,
+    FEATURE_COLS,
+    FEATURE_PATH,
+    MERGED_PATH,
+    TEAM_STATE,
+    TRAVEL_HOURS,
+    VENUE_STATE,
 )
 
 
 def _elo_expected(rating_a: float, rating_b: float) -> float:
-    """Expected score for player A."""
+    """Expected score for side A."""
     return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400))
 
 
-def build_elo(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute Elo ratings for each match.
+def _match_result_from_margin(margin: float) -> float:
+    if margin > 0:
+        return 1.0
+    if margin < 0:
+        return 0.0
+    return 0.5
 
-    Ratings are stored *before* the match result is applied (i.e., the
-    rating used for prediction, not the post-match rating).
-    """
+
+def _prepare_matches(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort matches deterministically before any sequential feature building."""
+    sort_cols = ["date", "year", "home_team", "away_team"]
+    return df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
+
+def _team_long_history(df: pd.DataFrame) -> pd.DataFrame:
+    """Create a team-centric history table with one row per team per match."""
+    home_result = df["margin"].apply(_match_result_from_margin)
+    away_result = 1.0 - home_result
+
+    home_rows = df[[
+        "date", "year", "round_num", "venue", "home_team", "away_team",
+        "margin", "home_score", "elo_home", "elo_home_post",
+    ]].copy()
+    home_rows["team"] = home_rows["home_team"]
+    home_rows["opponent"] = home_rows["away_team"]
+    home_rows["win"] = home_result.values
+    home_rows["team_margin"] = home_rows["margin"]
+    home_rows["team_score"] = home_rows["home_score"]
+    home_rows["elo_pre"] = home_rows["elo_home"]
+    home_rows["elo_post"] = home_rows["elo_home_post"]
+    home_rows["is_home"] = 1
+    home_rows["match_idx"] = home_rows.index
+
+    away_rows = df[[
+        "date", "year", "round_num", "venue", "home_team", "away_team",
+        "margin", "away_score", "elo_away", "elo_away_post",
+    ]].copy()
+    away_rows["team"] = away_rows["away_team"]
+    away_rows["opponent"] = away_rows["home_team"]
+    away_rows["win"] = away_result.values
+    away_rows["team_margin"] = -away_rows["margin"]
+    away_rows["team_score"] = away_rows["away_score"]
+    away_rows["elo_pre"] = away_rows["elo_away"]
+    away_rows["elo_post"] = away_rows["elo_away_post"]
+    away_rows["is_home"] = 0
+    away_rows["match_idx"] = away_rows.index
+
+    long = pd.concat([home_rows, away_rows], ignore_index=True)
+    return long.sort_values(
+        ["team", "date", "match_idx"], kind="mergesort"
+    ).reset_index(drop=True)
+
+
+def _build_h2h_feature(df: pd.DataFrame) -> pd.Series:
+    """Home-team historical win rate versus the away team, direction-aware."""
+    records = {}
+    values = []
+
+    for row in df.itertuples(index=False):
+        home = row.home_team
+        away = row.away_team
+        pair = tuple(sorted((home, away)))
+        home_wins, total = records.get(pair, (0.0, 0))
+        if total == 0:
+            values.append(0.5)
+        else:
+            if home == pair[0]:
+                values.append(home_wins / total)
+            else:
+                values.append(1.0 - (home_wins / total))
+
+        result = _match_result_from_margin(row.margin)
+        if home == pair[0]:
+            records[pair] = (home_wins + result, total + 1)
+        else:
+            records[pair] = (home_wins + (1.0 - result), total + 1)
+
+    return pd.Series(values, index=df.index, dtype=float)
+
+
+def _get_travel_hours(team_state: str, venue_state: str) -> float:
+    """Lookup travel hours between two states (symmetric)."""
+    if not team_state or not venue_state or team_state == venue_state:
+        return 0.0
+    pair = (team_state, venue_state)
+    rev_pair = (venue_state, team_state)
+    return TRAVEL_HOURS.get(pair, TRAVEL_HOURS.get(rev_pair, 1.5))
+
+
+def build_elo(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute pre-match and post-match Elo ratings with margin-based K."""
+    df = _prepare_matches(df).copy()
     ratings = {}
     elo_home_list = []
     elo_away_list = []
+    elo_home_post = []
+    elo_away_post = []
     prev_season = None
 
-    for _, row in df.iterrows():
-        season = row["year"]
-        home, away = row["home_team"], row["away_team"]
+    for row in df.itertuples(index=False):
+        season = row.year
+        home = row.home_team
+        away = row.away_team
 
-        # Season mean reversion
         if prev_season is not None and season != prev_season:
             for team in list(ratings.keys()):
                 ratings[team] = (
@@ -39,152 +137,69 @@ def build_elo(df: pd.DataFrame) -> pd.DataFrame:
 
         r_home = ratings.get(home, ELO_INIT)
         r_away = ratings.get(away, ELO_INIT)
-
-        # Record pre-match ratings
         elo_home_list.append(r_home)
         elo_away_list.append(r_away)
 
-        # Expected with home advantage
         exp_home = _elo_expected(r_home + ELO_HOME_ADV, r_away)
-        actual_home = 1.0 if row["margin"] > 0 else (0.5 if row["margin"] == 0 else 0.0)
+        actual_home = _match_result_from_margin(row.margin)
 
-        # Margin-based K multiplier
-        margin = abs(row["margin"])
-        # For AFL, a winning margin of ~30-40 is 'typical'.
-        # We use a log-scaled margin to prevent blowouts from overly biasing Elo.
-        k_multiplier = np.log1p(margin) * (2.2 / ((r_home - r_away) * 0.001 + 2.2))
+        # Margin-based K multiplier (capped)
+        margin = abs(row.margin)
+        k_multiplier = min(
+            np.log1p(margin) * (2.2 / ((r_home - r_away) * 0.001 + 2.2)),
+            ELO_MARGIN_K_CAP,
+        )
         k = ELO_K * k_multiplier
 
-        # Update
-        ratings[home] = r_home + k * (actual_home - exp_home)
-        ratings[away] = r_away + k * ((1 - actual_home) - (1 - exp_home))
+        new_home = r_home + k * (actual_home - exp_home)
+        new_away = r_away + k * ((1 - actual_home) - (1 - exp_home))
 
-    df = df.copy()
+        ratings[home] = new_home
+        ratings[away] = new_away
+        elo_home_post.append(new_home)
+        elo_away_post.append(new_away)
+
     df["elo_home"] = elo_home_list
     df["elo_away"] = elo_away_list
+    df["elo_home_post"] = elo_home_post
+    df["elo_away_post"] = elo_away_post
     df["elo_diff"] = df["elo_home"] - df["elo_away"]
-    df["elo_prob"] = df.apply(
-        lambda r: _elo_expected(r["elo_home"] + ELO_HOME_ADV, r["elo_away"]),
-        axis=1,
+    df["elo_prob"] = _elo_expected(
+        df["elo_home"] + ELO_HOME_ADV, df["elo_away"],
     )
-    # New: diff from market
-    df["elo_market_diff"] = df["elo_prob"] - df["market_prob_home"]
     return df
 
 
-def _rolling_team_stat(df: pd.DataFrame, team_col: str, stat_col: str,
-                       window: int, team: str) -> pd.Series:
-    """Compute rolling mean for a team, shifted by 1 to prevent leakage."""
-    mask = df[team_col] == team
-    return df.loc[mask, stat_col].shift(1).rolling(window, min_periods=1).mean()
-
-
 def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Build all rolling and derived features."""
-    df = df.copy()
-    teams = sorted(set(df["home_team"].unique()) | set(df["away_team"].unique()))
+    """Build rolling, matchup, travel, and derived features without leakage."""
+    df = _prepare_matches(df).copy()
+    long = _team_long_history(df)
 
-    # --- Per-team rolling stats ---
-    # We need to build team-level time series, then map back to matches.
-    # Create a long-form dataframe: one row per team per match.
-    home_rows = df[["date", "year", "round_num", "home_team", "away_team",
-                    "home_win", "margin", "home_score", "venue"]].copy()
-    home_rows["team"] = home_rows["home_team"]
-    home_rows["opponent"] = home_rows["away_team"]
-    home_rows["win"] = home_rows["home_win"]
-    home_rows["team_margin"] = home_rows["margin"]
-    home_rows["team_score"] = home_rows["home_score"]
-    home_rows["is_home"] = 1
-    home_rows["match_idx"] = home_rows.index
+    grouped = long.groupby("team", sort=False)
+    long["form_5"] = grouped["win"].transform(
+        lambda s: s.shift(1).rolling(5, min_periods=1).mean()
+    )
+    long["win_pct_10"] = grouped["win"].transform(
+        lambda s: s.shift(1).rolling(10, min_periods=1).mean()
+    )
+    long["margin_ewma"] = grouped["team_margin"].transform(
+        lambda s: s.shift(1).ewm(span=10, adjust=False, min_periods=1).mean()
+    )
+    long["scoring_ewma"] = grouped["team_score"].transform(
+        lambda s: s.shift(1).ewm(span=10, adjust=False, min_periods=1).mean()
+    )
+    long["venue_exp"] = grouped["venue"].transform(
+        lambda s: s.groupby(s).cumcount().astype(float)
+    )
+    long["rest_days"] = grouped["date"].transform(
+        lambda s: s.diff().dt.days.clip(lower=0, upper=30)
+    )
 
-    away_rows = df[["date", "year", "round_num", "home_team", "away_team",
-                    "home_win", "margin", "away_score", "venue"]].copy()
-    away_rows["team"] = away_rows["away_team"]
-    away_rows["opponent"] = away_rows["home_team"]
-    away_rows["win"] = 1 - away_rows["home_win"]
-    away_rows["team_margin"] = -away_rows["margin"]
-    away_rows["team_score"] = away_rows["away_score"]
-    away_rows["is_home"] = 0
-    away_rows["match_idx"] = away_rows.index
+    df["h2h_home_win_pct"] = _build_h2h_feature(df)
 
-    long = pd.concat([home_rows, away_rows]).sort_values(["team", "date"]).reset_index(drop=True)
-
-    # Shifted rolling features per team (shift(1) prevents leakage)
-    for team in teams:
-        mask = long["team"] == team
-        idx = long.index[mask]
-
-        # Form: rolling win rate over last 5
-        long.loc[idx, "form_5"] = (
-            long.loc[idx, "win"].shift(1).rolling(5, min_periods=1).mean()
-        )
-        # Win pct over last 10
-        long.loc[idx, "win_pct_10"] = (
-            long.loc[idx, "win"].shift(1).rolling(10, min_periods=1).mean()
-        )
-        # Margin EWMA
-        long.loc[idx, "margin_ewma"] = (
-            long.loc[idx, "team_margin"].shift(1).ewm(span=10, min_periods=1).mean()
-        )
-        # Scoring EWMA
-        long.loc[idx, "scoring_ewma"] = (
-            long.loc[idx, "team_score"].shift(1).ewm(span=10, min_periods=1).mean()
-        )
-        # Venue experience: cumulative games at this venue
-        venue_counts = long.loc[idx].groupby("venue").cumcount()
-        long.loc[idx, "venue_exp"] = venue_counts.values
-
-        # Rest days
-        long.loc[idx, "rest_days"] = (
-            long.loc[idx, "date"].diff().dt.days.clip(upper=30)
-        )
-
-    # --- H2H ---
-    # For each match, compute home team's historical win rate vs away team (any venue)
-    h2h_records = {}
-    h2h_col = []
-    for _, row in df.iterrows():
-        h, a = row["home_team"], row["away_team"]
-        # Use a sorted tuple to track H2H regardless of who is home
-        teams_key = tuple(sorted([h, a]))
-        wins, total = h2h_records.get(teams_key, (0, 0))
-        
-        # We want the win rate of the home_team against the away_team
-        # If total is 0, use 0.5
-        if total > 0:
-            # We need to know which team in the key is the 'home_team'
-            # Let's store wins as (count of team1 wins, count of team2 wins)
-            # but that's complex. Let's just store a simple dict of dicts.
-            pass
-            
-    # Redoing H2H more cleanly:
-    h2h_stats = {} # (teamA, teamB) -> [wins_A, total]
-    h2h_col = []
-    for _, row in df.iterrows():
-        h, a = row["home_team"], row["away_team"]
-        
-        # Get stats for h vs a
-        stats = h2h_stats.get((h, a), [0, 0])
-        rev_stats = h2h_stats.get((a, h), [0, 0])
-        
-        total_vs = stats[1] + rev_stats[1]
-        wins_vs = stats[0] + (rev_stats[1] - rev_stats[0]) # h's wins = (h as home wins) + (a as home losses)
-        
-        h2h_col.append(wins_vs / total_vs if total_vs > 0 else 0.5)
-        
-        # Update records
-        res = 1 if row["home_win"] == 1 else (0.5 if row["margin"] == 0 else 0)
-        curr = h2h_stats.get((h, a), [0, 0])
-        h2h_stats[(h, a)] = [curr[0] + res, curr[1] + 1]
-
-    df["h2h_home_win_pct"] = h2h_col
-
-    # --- Map long-form features back to match rows ---
     home_feats = long[long["is_home"] == 1].set_index("match_idx")[
         ["form_5", "win_pct_10", "margin_ewma", "scoring_ewma", "venue_exp", "rest_days"]
-    ].rename(columns=lambda c: c + "_home" if not c.endswith("_home") else c)
-
-    # Fix column names
+    ]
     home_feats.columns = [
         "form_home_5", "win_pct_home_10", "margin_ewma_home",
         "scoring_ewma_home", "venue_exp_home", "rest_days_home",
@@ -200,69 +215,213 @@ def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.join(home_feats).join(away_feats)
 
-    # Derived
+    # Diff features
     df["form_diff"] = df["form_home_5"] - df["form_away_5"]
+    df["win_pct_diff"] = df["win_pct_home_10"] - df["win_pct_away_10"]
+    df["venue_exp_diff"] = df["venue_exp_home"] - df["venue_exp_away"]
     df["rest_diff"] = df["rest_days_home"] - df["rest_days_away"]
+    df["margin_ewma_diff"] = df["margin_ewma_home"] - df["margin_ewma_away"]
+    df["scoring_ewma_diff"] = df["scoring_ewma_home"] - df["scoring_ewma_away"]
+    df["market_elo_delta"] = df["market_prob_home"] - df["elo_prob"]
 
-    # --- Travel and State ---
-    from config import TEAM_STATE, VENUE_STATE
-    
-    # State-to-state flight time approximation (hours)
-    # Simple lookup for dist between team state and venue state
-    # (Default 1.0)
-    FLIGHT_TIMES = {
-        ("VIC", "SA"): 1.0, ("VIC", "NSW"): 1.0, ("VIC", "TAS"): 1.0, 
-        ("VIC", "QLD"): 2.0, ("VIC", "WA"): 4.0, ("VIC", "NT"): 3.0,
-        ("SA", "VIC"): 1.0, ("SA", "NSW"): 1.5, ("SA", "QLD"): 2.5, ("SA", "WA"): 3.0,
-        ("WA", "VIC"): 4.0, ("WA", "SA"): 3.0, ("WA", "NSW"): 4.5, ("WA", "QLD"): 5.0,
-        ("NSW", "VIC"): 1.0, ("NSW", "SA"): 1.5, ("NSW", "QLD"): 1.5, ("NSW", "WA"): 4.5,
-        ("QLD", "VIC"): 2.0, ("QLD", "SA"): 2.5, ("QLD", "NSW"): 1.5, ("QLD", "WA"): 5.0,
-    }
-
-    def get_travel_dist(team, venue):
-        ts = TEAM_STATE.get(team)
-        vs = VENUE_STATE.get(venue)
-        if not ts or not vs: return 1.0
-        if ts == vs: return 0.0
-        return FLIGHT_TIMES.get((ts, vs), 1.5)
-
-    df["is_home_state_home"] = df.apply(
-        lambda r: 1 if TEAM_STATE.get(r["home_team"]) == VENUE_STATE.get(r["venue"]) else 0,
-        axis=1
+    # Travel / state features
+    df["is_home_state"] = df.apply(
+        lambda r: int(TEAM_STATE.get(r["home_team"], "") == VENUE_STATE.get(r["venue"], "?")),
+        axis=1,
     )
-    df["is_home_state_away"] = df.apply(
-        lambda r: 1 if TEAM_STATE.get(r["away_team"]) == VENUE_STATE.get(r["venue"]) else 0,
-        axis=1
+    df["travel_hours_home"] = df.apply(
+        lambda r: _get_travel_hours(TEAM_STATE.get(r["home_team"]), VENUE_STATE.get(r["venue"])),
+        axis=1,
     )
-    df["travel_dist_home"] = df.apply(lambda r: get_travel_dist(r["home_team"], r["venue"]), axis=1)
-    df["travel_dist_away"] = df.apply(lambda r: get_travel_dist(r["away_team"], r["venue"]), axis=1)
+    df["travel_hours_away"] = df.apply(
+        lambda r: _get_travel_hours(TEAM_STATE.get(r["away_team"]), VENUE_STATE.get(r["venue"])),
+        axis=1,
+    )
 
-    # Convert round_num to numeric
+    # Round number
     finals_map = {
-        "Elimination Final": 25,
-        "Qualifying Final": 25,
-        "Semi Final": 26,
-        "Preliminary Final": 27,
-        "Grand Final": 28,
+        "Elimination Final": 25, "Qualifying Final": 25,
+        "Semi Final": 26, "Preliminary Final": 27, "Grand Final": 28,
     }
-    def clean_round(x):
-        if str(x).isdigit(): return int(x)
-        # Handle "Round X"
-        if "Round" in str(x):
-            try: return int(str(x).split()[-1])
-            except: pass
-        return finals_map.get(x, 25)
+    df["season_round"] = df["round_num"].map(
+        lambda x: finals_map.get(x, int(x) if str(x).isdigit() else 25)
+    )
 
-    df["season_round"] = df["round_num"].map(clean_round)
+    # NaN fill with sensible defaults
+    fill_values = {
+        "form_home_5": 0.5, "form_away_5": 0.5, "form_diff": 0.0,
+        "win_pct_home_10": 0.5, "win_pct_away_10": 0.5, "win_pct_diff": 0.0,
+        "venue_exp_home": 0.0, "venue_exp_away": 0.0, "venue_exp_diff": 0.0,
+        "rest_days_home": 30.0, "rest_days_away": 30.0, "rest_diff": 0.0,
+        "h2h_home_win_pct": 0.5,
+        "margin_ewma_home": 0.0, "margin_ewma_away": 0.0, "margin_ewma_diff": 0.0,
+        "scoring_ewma_home": 80.0, "scoring_ewma_away": 80.0, "scoring_ewma_diff": 0.0,
+        "market_elo_delta": 0.0,
+        "travel_hours_home": 0.0, "travel_hours_away": 0.0,
+        "is_home_state": 1,
+    }
+    for column, value in fill_values.items():
+        if column in df.columns:
+            df[column] = df[column].fillna(value)
 
     return df
 
 
-def build_feature_matrix(merged_path: str = MERGED_PATH,
-                         output_path: str = FEATURE_PATH) -> pd.DataFrame:
+def _team_history_for_snapshot(df: pd.DataFrame, team: str, as_of_date=None) -> pd.DataFrame:
+    """Return prior matches for a team from either home or away perspective."""
+    home = df[df["home_team"] == team].copy()
+    if not home.empty:
+        home["team"] = team
+        home["win"] = home["margin"].apply(_match_result_from_margin)
+        home["team_margin"] = home["margin"]
+        home["team_score"] = home["home_score"]
+        home["elo_post"] = home["elo_home_post"]
+
+    away = df[df["away_team"] == team].copy()
+    if not away.empty:
+        away["team"] = team
+        away["win"] = away["margin"].apply(lambda m: 1.0 - _match_result_from_margin(m))
+        away["team_margin"] = -away["margin"]
+        away["team_score"] = away["away_score"]
+        away["elo_post"] = away["elo_away_post"]
+
+    history = pd.concat([home, away], ignore_index=True, sort=False)
+    if history.empty:
+        return history
+
+    history = history.sort_values(["date", "year", "home_team", "away_team"], kind="mergesort")
+    if as_of_date is not None:
+        history = history[history["date"] < pd.Timestamp(as_of_date)]
+    return history.reset_index(drop=True)
+
+
+def _team_snapshot(df: pd.DataFrame, team: str, venue: str = None, match_date=None) -> dict:
+    """Build the current pre-match state for a single team."""
+    history = _team_history_for_snapshot(df, team, as_of_date=match_date)
+    if history.empty:
+        return {
+            "elo": ELO_INIT, "form_5": 0.5, "win_pct_10": 0.5,
+            "margin_ewma": 0.0, "scoring_ewma": 80.0,
+            "venue_exp": 0.0, "rest_days": 30.0,
+        }
+
+    wins = history["win"]
+    margins = history["team_margin"]
+    scores = history["team_score"]
+    last_date = history["date"].iloc[-1]
+    rest_days = 7.0 if match_date is None else float(
+        np.clip((pd.Timestamp(match_date) - last_date).days, 0, 30)
+    )
+    venue_exp = float((history["venue"] == venue).sum()) if venue else 0.0
+
+    return {
+        "elo": float(history["elo_post"].iloc[-1]),
+        "form_5": float(wins.tail(5).mean()),
+        "win_pct_10": float(wins.tail(10).mean()),
+        "margin_ewma": float(margins.ewm(span=10, adjust=False).mean().iloc[-1]),
+        "scoring_ewma": float(scores.ewm(span=10, adjust=False).mean().iloc[-1]),
+        "venue_exp": venue_exp,
+        "rest_days": rest_days,
+    }
+
+
+def _current_h2h_prob(df: pd.DataFrame, home_team: str, away_team: str, match_date=None) -> float:
+    """Home-team win rate versus the away team before the given match date."""
+    history = df[
+        ((df["home_team"] == home_team) & (df["away_team"] == away_team))
+        | ((df["home_team"] == away_team) & (df["away_team"] == home_team))
+    ].copy()
+    if match_date is not None:
+        history = history[history["date"] < pd.Timestamp(match_date)]
+    if history.empty:
+        return 0.5
+
+    outcomes = []
+    for row in history.itertuples(index=False):
+        result = _match_result_from_margin(row.margin)
+        outcomes.append(result if row.home_team == home_team else 1.0 - result)
+    return float(np.mean(outcomes))
+
+
+def build_current_match_features(
+    history_df: pd.DataFrame,
+    home_team: str,
+    away_team: str,
+    odds_home: float = None,
+    odds_away: float = None,
+    venue: str = None,
+    match_date=None,
+    season_round: int = 1,
+    is_final: int = 0,
+) -> dict | None:
+    """Build a feature dict for a future match from historical data only."""
+    if history_df.empty:
+        return None
+
+    home = _team_snapshot(history_df, home_team, venue=venue, match_date=match_date)
+    away = _team_snapshot(history_df, away_team, venue=venue, match_date=match_date)
+    elo_prob = _elo_expected(home["elo"] + ELO_HOME_ADV, away["elo"])
+
+    if odds_home and odds_away and odds_home > 0 and odds_away > 0:
+        implied_home = 1.0 / odds_home
+        implied_away = 1.0 / odds_away
+        market_overround = implied_home + implied_away
+        market_prob_home = implied_home / market_overround
+        market_prob_away = implied_away / market_overround
+    else:
+        market_prob_home = 0.5
+        market_prob_away = 0.5
+        market_overround = 1.0
+
+    home_state = TEAM_STATE.get(home_team, "")
+    away_state = TEAM_STATE.get(away_team, "")
+    venue_state = VENUE_STATE.get(venue, "") if venue else ""
+
+    features = {
+        "elo_diff": home["elo"] - away["elo"],
+        "elo_prob": elo_prob,
+        "market_prob_home": market_prob_home,
+        "market_prob_away": market_prob_away,
+        "market_overround": market_overround,
+        "market_elo_delta": market_prob_home - elo_prob,
+        "is_home_state": int(home_state == venue_state) if venue_state else 1,
+        "travel_hours_home": _get_travel_hours(home_state, venue_state),
+        "travel_hours_away": _get_travel_hours(away_state, venue_state),
+        "form_home_5": home["form_5"],
+        "form_away_5": away["form_5"],
+        "form_diff": home["form_5"] - away["form_5"],
+        "win_pct_home_10": home["win_pct_10"],
+        "win_pct_away_10": away["win_pct_10"],
+        "win_pct_diff": home["win_pct_10"] - away["win_pct_10"],
+        "venue_exp_home": home["venue_exp"],
+        "venue_exp_away": away["venue_exp"],
+        "venue_exp_diff": home["venue_exp"] - away["venue_exp"],
+        "rest_days_home": home["rest_days"],
+        "rest_days_away": away["rest_days"],
+        "rest_diff": home["rest_days"] - away["rest_days"],
+        "h2h_home_win_pct": _current_h2h_prob(
+            history_df, home_team, away_team, match_date=match_date
+        ),
+        "season_round": season_round,
+        "is_final": is_final,
+        "margin_ewma_home": home["margin_ewma"],
+        "margin_ewma_away": away["margin_ewma"],
+        "margin_ewma_diff": home["margin_ewma"] - away["margin_ewma"],
+        "scoring_ewma_home": home["scoring_ewma"],
+        "scoring_ewma_away": away["scoring_ewma"],
+        "scoring_ewma_diff": home["scoring_ewma"] - away["scoring_ewma"],
+    }
+    return features
+
+
+def build_feature_matrix(
+    merged_path: str = MERGED_PATH,
+    output_path: str = FEATURE_PATH,
+) -> pd.DataFrame:
     """Full pipeline: load merged data, compute all features, save."""
     print("Loading merged data...")
     df = pd.read_parquet(merged_path)
+    df = _prepare_matches(df)
 
     print("Building Elo ratings...")
     df = build_elo(df)
@@ -270,14 +429,15 @@ def build_feature_matrix(merged_path: str = MERGED_PATH,
     print("Building rolling features...")
     df = build_rolling_features(df)
 
-    # Drop rows with NaN in feature columns (early games with insufficient history)
+    missing_features = [col for col in FEATURE_COLS if col not in df.columns]
+    if missing_features:
+        raise ValueError(f"Missing engineered features: {missing_features}")
+
     before = len(df)
-    df = df.dropna(subset=FEATURE_COLS).reset_index(drop=True)
-    print(f"  Dropped {before - len(df)} rows with missing features")
+    df = df.dropna(subset=["home_win", "odds_home", "odds_away"]).reset_index(drop=True)
+    print(f"  Dropped {before - len(df)} rows with missing targets or odds")
 
     print(f"Feature matrix: {df.shape}")
-    print(f"  Columns: {list(df.columns)}")
-
     if output_path:
         df.to_parquet(output_path, index=False)
         print(f"Saved to {output_path}")

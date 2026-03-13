@@ -1,23 +1,42 @@
-"""Model training: logistic regression + LightGBM with calibration."""
+"""Model training: regularized logistic regression + LightGBM + calibrated stack."""
 
 import os
+from dataclasses import dataclass
+
+import joblib
+import lightgbm as lgb
+import matplotlib
 import numpy as np
 import pandas as pd
-import joblib
-import matplotlib
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
+from sklearn.preprocessing import StandardScaler
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.linear_model import LogisticRegression
-from sklearn.calibration import CalibratedClassifierCV, calibration_curve
-from sklearn.metrics import log_loss, brier_score_loss, accuracy_score
-from sklearn.preprocessing import StandardScaler
-from sklearn.frozen import FrozenEstimator
-import lightgbm as lgb
+from sklearn.calibration import calibration_curve
 
 from config import (
-    FEATURE_PATH, MODEL_DIR, FEATURE_COLS,
-    TRAIN_END, VAL_START, VAL_END, TEST_START, TEST_END,
+    FEATURE_COLS,
+    FEATURE_PATH,
+    MODEL_DIR,
+    TEST_END,
+    TEST_START,
+    TRAIN_END,
+    VAL_END,
+    VAL_START,
 )
+
+
+def _clip_probs(values) -> np.ndarray:
+    """Keep probabilities away from 0/1 to stabilize log loss and logit math."""
+    return np.clip(np.asarray(values, dtype=float), 1e-6, 1 - 1e-6)
+
+
+def _logit(values) -> np.ndarray:
+    """Stable logit transform."""
+    probs = _clip_probs(values)
+    return np.log(probs / (1 - probs))
 
 
 def temporal_split(df: pd.DataFrame):
@@ -30,6 +49,7 @@ def temporal_split(df: pd.DataFrame):
 
 def evaluate(y_true, y_prob, label: str, market_prob=None):
     """Print evaluation metrics."""
+    y_prob = _clip_probs(y_prob)
     ll = log_loss(y_true, y_prob)
     bs = brier_score_loss(y_true, y_prob)
     acc = accuracy_score(y_true, (y_prob >= 0.5).astype(int))
@@ -38,18 +58,20 @@ def evaluate(y_true, y_prob, label: str, market_prob=None):
     print(f"  Brier Score: {bs:.4f}")
     print(f"  Accuracy:    {acc:.4f}")
     if market_prob is not None:
+        market_prob = _clip_probs(market_prob)
         m_ll = log_loss(y_true, market_prob)
         m_bs = brier_score_loss(y_true, market_prob)
         m_acc = accuracy_score(y_true, (market_prob >= 0.5).astype(int))
         print(f"  Market Log Loss:    {m_ll:.4f}")
         print(f"  Market Brier Score: {m_bs:.4f}")
         print(f"  Market Accuracy:    {m_acc:.4f}")
+        print(f"  Delta vs Market LL: {m_ll - ll:+.4f}")
     return {"log_loss": ll, "brier_score": bs, "accuracy": acc}
 
 
 def plot_calibration(y_true, y_prob, label: str, path: str):
     """Save calibration curve plot."""
-    frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=10)
+    frac_pos, mean_pred = calibration_curve(y_true, _clip_probs(y_prob), n_bins=10)
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.plot(mean_pred, frac_pos, "s-", label=label)
     ax.plot([0, 1], [0, 1], "k--", label="Perfect")
@@ -62,99 +84,233 @@ def plot_calibration(y_true, y_prob, label: str, path: str):
     print(f"  Calibration plot saved: {path}")
 
 
+@dataclass
+class EnsemblePredictor:
+    """Final prediction bundle used by both backtest and live scanning."""
+
+    feature_cols: list[str]
+    scaler: StandardScaler
+    logreg: LogisticRegression
+    lgb_model: lgb.LGBMClassifier
+    stacker: LogisticRegression
+
+    def _frame(self, X) -> pd.DataFrame:
+        if isinstance(X, pd.DataFrame):
+            return X.loc[:, self.feature_cols].copy()
+        return pd.DataFrame(X, columns=self.feature_cols)
+
+    def _base_probs(self, X) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        frame = self._frame(X)
+        lr_prob = self.logreg.predict_proba(self.scaler.transform(frame))[:, 1]
+        lgb_prob = self.lgb_model.predict_proba(frame)[:, 1]
+        market_prob = frame["market_prob_home"].to_numpy(dtype=float)
+        return _clip_probs(lr_prob), _clip_probs(lgb_prob), _clip_probs(market_prob)
+
+    def _stack_features(self, X) -> np.ndarray:
+        lr_prob, lgb_prob, market_prob = self._base_probs(X)
+        return np.column_stack([
+            _logit(lr_prob),
+            _logit(lgb_prob),
+            _logit(market_prob),
+            lgb_prob - market_prob,
+            lr_prob - market_prob,
+        ])
+
+    def predict_proba(self, X) -> np.ndarray:
+        prob = _clip_probs(self.stacker.predict_proba(self._stack_features(X))[:, 1])
+        return np.column_stack([1 - prob, prob])
+
+    def predict(self, X) -> np.ndarray:
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+def _tune_logreg(
+    X_train: pd.DataFrame, y_train: np.ndarray,
+    X_val: pd.DataFrame, y_val: np.ndarray,
+) -> tuple[StandardScaler, LogisticRegression, dict]:
+    """Pick logistic regression regularization by validation log loss."""
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_val_sc = scaler.transform(X_val)
+
+    candidates = [0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0]
+    best_score = float("inf")
+    best_model = None
+    best_meta = {}
+
+    for c_value in candidates:
+        model = LogisticRegression(max_iter=5000, C=c_value, solver="lbfgs")
+        model.fit(X_train_sc, y_train)
+        val_prob = model.predict_proba(X_val_sc)[:, 1]
+        score = log_loss(y_val, _clip_probs(val_prob))
+        if score < best_score:
+            best_score = score
+            best_model = model
+            best_meta = {"C": c_value, "val_log_loss": score}
+
+    return scaler, best_model, best_meta
+
+
+def _tune_lgbm(
+    X_train: pd.DataFrame, y_train: np.ndarray,
+    X_val: pd.DataFrame, y_val: np.ndarray,
+) -> tuple[lgb.LGBMClassifier, dict]:
+    """Pick a conservative LightGBM configuration by validation log loss."""
+    candidates = [
+        {
+            "n_estimators": 400, "learning_rate": 0.03, "max_depth": 4,
+            "num_leaves": 15, "min_child_samples": 40, "subsample": 0.85,
+            "colsample_bytree": 0.85, "reg_alpha": 0.2, "reg_lambda": 0.5,
+        },
+        {
+            "n_estimators": 500, "learning_rate": 0.025, "max_depth": 5,
+            "num_leaves": 23, "min_child_samples": 30, "subsample": 0.8,
+            "colsample_bytree": 0.8, "reg_alpha": 0.1, "reg_lambda": 1.0,
+        },
+        {
+            "n_estimators": 300, "learning_rate": 0.05, "max_depth": 3,
+            "num_leaves": 7, "min_child_samples": 50, "subsample": 0.9,
+            "colsample_bytree": 0.9, "reg_alpha": 0.3, "reg_lambda": 1.5,
+        },
+    ]
+
+    best_score = float("inf")
+    best_model = None
+    best_meta = {}
+
+    for params in candidates:
+        model = lgb.LGBMClassifier(
+            objective="binary", random_state=42, verbose=-1, **params,
+        )
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            eval_metric="binary_logloss",
+            callbacks=[
+                lgb.early_stopping(50, verbose=False),
+                lgb.log_evaluation(0),
+            ],
+        )
+        val_prob = model.predict_proba(X_val)[:, 1]
+        score = log_loss(y_val, _clip_probs(val_prob))
+        if score < best_score:
+            best_score = score
+            best_model = model
+            best_meta = dict(params)
+            best_meta["val_log_loss"] = score
+            best_meta["best_iteration_"] = getattr(model, "best_iteration_", None)
+
+    return best_model, best_meta
+
+
+def _fit_stacker(
+    lr_val_prob: np.ndarray, lgb_val_prob: np.ndarray,
+    market_val_prob: np.ndarray, y_val: np.ndarray,
+) -> LogisticRegression:
+    """Blend model signals with the market using a calibrated logistic stacker."""
+    stack_X = np.column_stack([
+        _logit(lr_val_prob),
+        _logit(lgb_val_prob),
+        _logit(market_val_prob),
+        lgb_val_prob - market_val_prob,
+        lr_val_prob - market_val_prob,
+    ])
+
+    best_score = float("inf")
+    best_model = None
+    for c_value in [0.05, 0.1, 0.25, 0.5, 1.0]:
+        model = LogisticRegression(max_iter=5000, C=c_value, solver="lbfgs")
+        model.fit(stack_X, y_val)
+        score = log_loss(y_val, _clip_probs(model.predict_proba(stack_X)[:, 1]))
+        if score < best_score:
+            best_score = score
+            best_model = model
+
+    return best_model
+
+
+def fit_model_bundle(
+    train_df: pd.DataFrame,
+    calibration_df: pd.DataFrame,
+) -> tuple[EnsemblePredictor, dict]:
+    """Train base models on one period and fit the stacker on a later calibration fold."""
+    X_train = train_df[FEATURE_COLS]
+    y_train = train_df["home_win"].to_numpy()
+    X_cal = calibration_df[FEATURE_COLS]
+    y_cal = calibration_df["home_win"].to_numpy()
+
+    scaler, logreg, logreg_meta = _tune_logreg(X_train, y_train, X_cal, y_cal)
+    lgb_model, lgb_meta = _tune_lgbm(X_train, y_train, X_cal, y_cal)
+
+    lr_cal_prob = logreg.predict_proba(scaler.transform(X_cal))[:, 1]
+    lgb_cal_prob = lgb_model.predict_proba(X_cal)[:, 1]
+    market_cal_prob = calibration_df["market_prob_home"].to_numpy()
+    stacker = _fit_stacker(lr_cal_prob, lgb_cal_prob, market_cal_prob, y_cal)
+
+    predictor = EnsemblePredictor(
+        feature_cols=list(FEATURE_COLS),
+        scaler=scaler,
+        logreg=logreg,
+        lgb_model=lgb_model,
+        stacker=stacker,
+    )
+    meta = {"logreg": logreg_meta, "lgb": lgb_meta}
+    return predictor, meta
+
+
 def train_models(df: pd.DataFrame = None):
-    """Train logistic regression and LightGBM, calibrate, evaluate."""
+    """Train the model stack, evaluate it, and save artifacts."""
     if df is None:
         df = pd.read_parquet(FEATURE_PATH)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     train, val, test = temporal_split(df)
-
-    X_train = train[FEATURE_COLS]
-    y_train = train["home_win"].values
-    X_val = val[FEATURE_COLS]
-    y_val = val["home_win"].values
-    X_test = test[FEATURE_COLS]
-    y_test = test["home_win"].values
+    if train.empty or val.empty or test.empty:
+        raise ValueError("Temporal split produced an empty train/val/test segment")
 
     print(f"Train: {len(train)} | Val: {len(val)} | Test: {len(test)}")
+    predictor, meta = fit_model_bundle(train, val)
+    print(f"Selected logistic params: {meta['logreg']}")
+    print(f"Selected LightGBM params: {meta['lgb']}")
 
-    # --- Logistic Regression ---
-    scaler = StandardScaler()
-    X_train_sc = scaler.fit_transform(X_train)
-    X_val_sc = scaler.transform(X_val)
-    X_test_sc = scaler.transform(X_test)
+    X_val = val[FEATURE_COLS]
+    X_test = test[FEATURE_COLS]
+    y_val = val["home_win"].to_numpy()
+    y_test = test["home_win"].to_numpy()
+    market_val = val["market_prob_home"].to_numpy()
+    market_test = test["market_prob_home"].to_numpy()
 
-    lr = LogisticRegression(max_iter=1000, C=1.0)
-    lr.fit(X_train_sc, y_train)
+    lr_val_prob, lgb_val_prob, _ = predictor._base_probs(X_val)
+    lr_test_prob, lgb_test_prob, _ = predictor._base_probs(X_test)
+    ens_val_prob = predictor.predict_proba(X_val)[:, 1]
+    ens_test_prob = predictor.predict_proba(X_test)[:, 1]
 
-    lr_val_prob = lr.predict_proba(X_val_sc)[:, 1]
-    lr_test_prob = lr.predict_proba(X_test_sc)[:, 1]
+    evaluate(y_val, market_val, "Market (Val)")
+    evaluate(y_test, market_test, "Market (Test)")
+    evaluate(y_val, lr_val_prob, "LogReg (Val)", market_val)
+    evaluate(y_test, lr_test_prob, "LogReg (Test)", market_test)
+    evaluate(y_val, lgb_val_prob, "LightGBM (Val)", market_val)
+    evaluate(y_test, lgb_test_prob, "LightGBM (Test)", market_test)
+    evaluate(y_val, ens_val_prob, "Ensemble (Val)", market_val)
+    evaluate(y_test, ens_test_prob, "Ensemble (Test)", market_test)
 
-    evaluate(y_val, lr_val_prob, "LogReg (Val)", val["market_prob_home"].values)
-    evaluate(y_test, lr_test_prob, "LogReg (Test)", test["market_prob_home"].values)
-
-    # --- Ensemble Model ---
-    # We use a simple average of calibrated LogReg and calibrated LightGBM
-    from sklearn.ensemble import VotingClassifier
-
-    lr = LogisticRegression(max_iter=1000, C=1.0)
-    lgb_model = lgb.LGBMClassifier(
-        n_estimators=200,
-        learning_rate=0.03,
-        max_depth=3,
-        num_leaves=7,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_samples=50,
-        random_state=42,
-        verbose=-1,
-    )
-
-    # Use CalibratedClassifierCV with CV (default 5-fold)
-    # This is more stable as it uses more data for calibration
-    cal_lr = CalibratedClassifierCV(lr, method="sigmoid", cv=5)
-    cal_lgb = CalibratedClassifierCV(lgb_model, method="sigmoid", cv=5)
-
-    # Combine X_train and X_val for a larger calibration/training set
-    X_train_full = pd.concat([X_train, X_val])
-    y_train_full = np.concatenate([y_train, y_val])
-    
-    # Scale for LogReg
-    X_train_full_sc = scaler.fit_transform(X_train_full)
-    X_test_sc = scaler.transform(X_test)
-
-    print("Training Calibrated LogReg...")
-    cal_lr.fit(X_train_full_sc, y_train_full)
-    print("Training Calibrated LightGBM...")
-    cal_lgb.fit(X_train_full, y_train_full)
-
-    lr_prob = cal_lr.predict_proba(X_test_sc)[:, 1]
-    lgb_prob = cal_lgb.predict_proba(X_test)[:, 1]
-    
-    # Ensemble: 70% LogReg, 30% LightGBM (LogReg is more robust here)
-    ensemble_prob = 0.7 * lr_prob + 0.3 * lgb_prob
-    
-    evaluate(y_test, lr_prob, "Calibrated LogReg (Test)", test["market_prob_home"].values)
-    evaluate(y_test, lgb_prob, "Calibrated LightGBM (Test)", test["market_prob_home"].values)
-    evaluate(y_test, ensemble_prob, "Ensemble (Test)", test["market_prob_home"].values)
-
-    # Calibration plots
-    plot_calibration(y_test, ensemble_prob, "Ensemble",
+    plot_calibration(y_test, market_test, "Market",
+                     os.path.join(MODEL_DIR, "calibration_market.png"))
+    plot_calibration(y_test, lgb_test_prob, "LightGBM Raw",
+                     os.path.join(MODEL_DIR, "calibration_lgb_raw.png"))
+    plot_calibration(y_test, ens_test_prob, "Ensemble",
                      os.path.join(MODEL_DIR, "calibration_ensemble.png"))
 
-    # --- Save ---
-    joblib.dump(scaler, os.path.join(MODEL_DIR, "scaler.pkl"))
-    joblib.dump(cal_lr, os.path.join(MODEL_DIR, "logreg_cal.pkl"))
-    joblib.dump(cal_lgb, os.path.join(MODEL_DIR, "lgb_cal.pkl"))
-    print(f"\nModels saved to {MODEL_DIR}/")
+    importance = pd.Series(
+        predictor.lgb_model.feature_importances_, index=FEATURE_COLS
+    ).sort_values(ascending=False)
+    print("\nFeature Importance (LightGBM):")
+    print(importance.to_string())
 
-    return {
-        "scaler": scaler,
-        "logreg_cal": cal_lr,
-        "lgb_cal": cal_lgb,
-        "ensemble_prob": ensemble_prob
-    }
+    joblib.dump(predictor, os.path.join(MODEL_DIR, "model_bundle.pkl"))
+    print(f"\nModel bundle saved to {MODEL_DIR}/")
+
+    return {"predictor": predictor, "meta": meta}
 
 
 if __name__ == "__main__":

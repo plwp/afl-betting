@@ -20,13 +20,10 @@ MERGED_PATH = os.path.join(DATA_DIR, "afl_merged.parquet")
 FEATURE_PATH = os.path.join(DATA_DIR, "feature_matrix.parquet")
 ODDS_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".odds_cache")
 
-# --- Team Name Mappings (canonical → variants) ---
-# Canonical names use the odds dataset convention.
+# --- Team Name Mappings ---
 TEAM_NAME_MAP = {
-    # match CSV name  →  canonical (odds) name
     "Brisbane Lions": "Brisbane",
     "Greater Western Sydney": "GWS Giants",
-    # these are already identical, but listed for completeness
     "Adelaide": "Adelaide",
     "Carlton": "Carlton",
     "Collingwood": "Collingwood",
@@ -53,21 +50,21 @@ ALL_TEAMS = sorted(set(TEAM_NAME_MAP.values()))
 ELO_K = 30
 ELO_HOME_ADV = 30
 ELO_INIT = 1500
-ELO_SEASON_REVERT = 0.33  # revert 1/3 towards mean each season
-ELO_WARMUP_BEFORE = 2009  # use data from 2000+ if available for warmup
+ELO_SEASON_REVERT = 0.33
+ELO_MARGIN_K_CAP = 2.5  # cap on margin-based K multiplier
 
 # --- Temporal Splits ---
-TRAIN_END = 2020      # train: <= 2020
-VAL_START = 2021      # validation: 2021-2022
+TRAIN_END = 2020
+VAL_START = 2021
 VAL_END = 2022
-TEST_START = 2023     # test: 2023-2024
+TEST_START = 2023
 TEST_END = 2024
 
-# --- Betting Parameters ---
+# --- Betting Parameters (conservative from Gemini) ---
 KELLY_FRACTION = 0.15
-MAX_BET_FRACTION = 0.03  # max 3% of bankroll
+MAX_BET_FRACTION = 0.03
 MIN_STAKE = 5.0
-EDGE_THRESHOLD = 0.05    # minimum 5% edge to bet
+EDGE_THRESHOLD = 0.05
 INITIAL_BANKROLL = 1000.0
 
 # --- Team-to-State Mappings ---
@@ -82,42 +79,58 @@ TEAM_STATE = {
     "Western Bulldogs": "VIC",
 }
 
-# --- Venue-to-State Mappings ---
 VENUE_STATE = {
-    "M.C.G.": "VIC", "Docklands": "VIC", "Kardinia Park": "VIC",
-    "Eureka Stadium": "VIC",
-    "S.C.G.": "NSW", "Stadium Australia": "NSW", "Blacktown": "NSW",
-    "Sydney Showground": "NSW",
-    "Subiaco": "WA", "Perth Stadium": "WA",
-    "Football Park": "SA", "Adelaide Oval": "SA", "Norwood Oval": "SA",
-    "Summit Sports Park": "SA",
-    "Gabba": "QLD", "Carrara": "QLD", "Cazaly's Stadium": "QLD",
-    "Riverway Stadium": "QLD",
-    "York Park": "TAS", "Bellerive Oval": "TAS",
+    "M.C.G.": "VIC", "Docklands": "VIC", "Marvel Stadium": "VIC",
+    "Kardinia Park": "VIC", "GMHBA Stadium": "VIC", "Eureka Stadium": "VIC",
+    "S.C.G.": "NSW", "Stadium Australia": "NSW", "Accor Stadium": "NSW",
+    "Sydney Showground": "NSW", "ENGIE Stadium": "NSW", "Giants Stadium": "NSW",
+    "Subiaco": "WA", "Perth Stadium": "WA", "Optus Stadium": "WA",
+    "Domain Stadium": "WA",
+    "Football Park": "SA", "Adelaide Oval": "SA",
+    "Gabba": "QLD", "Carrara": "QLD", "People First Stadium": "QLD",
+    "Cazaly's Stadium": "QLD", "Riverway Stadium": "QLD",
+    "York Park": "TAS", "Bellerive Oval": "TAS", "UTAS Stadium": "TAS",
+    "Blundstone Arena": "TAS",
     "Manuka Oval": "ACT",
-    "Marrara Oval": "NT", "Traeger Park": "NT",
+    "Marrara Oval": "NT", "TIO Stadium": "NT", "Traeger Park": "NT",
+}
+
+# Approximate flight hours between states (symmetric)
+TRAVEL_HOURS = {
+    ("VIC", "SA"): 1.0, ("VIC", "QLD"): 2.5, ("VIC", "WA"): 4.0,
+    ("VIC", "NSW"): 1.5, ("VIC", "TAS"): 1.0, ("VIC", "ACT"): 1.0,
+    ("VIC", "NT"): 4.0,
+    ("SA", "QLD"): 2.5, ("SA", "WA"): 3.0, ("SA", "NSW"): 2.0,
+    ("SA", "TAS"): 2.0, ("SA", "ACT"): 2.0, ("SA", "NT"): 3.0,
+    ("QLD", "WA"): 5.0, ("QLD", "NSW"): 1.5, ("QLD", "TAS"): 3.0,
+    ("QLD", "ACT"): 2.0, ("QLD", "NT"): 3.0,
+    ("WA", "NSW"): 4.5, ("WA", "TAS"): 5.0, ("WA", "ACT"): 4.5,
+    ("WA", "NT"): 3.5,
+    ("NSW", "TAS"): 2.0, ("NSW", "ACT"): 0.5, ("NSW", "NT"): 4.0,
+    ("TAS", "ACT"): 2.0, ("TAS", "NT"): 4.5,
+    ("ACT", "NT"): 4.0,
 }
 
 # --- Feature Columns ---
 FEATURE_COLS = [
     "elo_diff", "elo_prob",
-    "market_prob_home", "elo_market_diff",
-    "is_home_state_home", "is_home_state_away",
-    "travel_dist_home", "travel_dist_away",
+    "market_prob_home", "market_prob_away", "market_overround",
+    "market_elo_delta",
+    "is_home_state", "travel_hours_home", "travel_hours_away",
     "form_home_5", "form_away_5", "form_diff",
-    "win_pct_home_10", "win_pct_away_10",
-    "venue_exp_home", "venue_exp_away",
+    "win_pct_home_10", "win_pct_away_10", "win_pct_diff",
+    "venue_exp_home", "venue_exp_away", "venue_exp_diff",
     "rest_days_home", "rest_days_away", "rest_diff",
     "h2h_home_win_pct",
     "season_round", "is_final",
-    "margin_ewma_home", "margin_ewma_away",
-    "scoring_ewma_home", "scoring_ewma_away",
+    "margin_ewma_home", "margin_ewma_away", "margin_ewma_diff",
+    "scoring_ewma_home", "scoring_ewma_away", "scoring_ewma_diff",
 ]
 
 # --- Odds API ---
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_API_BASE = "https://api.the-odds-api.com/v4/sports/aussierules_afl/odds/"
-ODDS_CACHE_TTL = 900  # 15 minutes in seconds
+ODDS_CACHE_TTL = 900
 AU_BOOKMAKERS = [
     "sportsbet", "tab", "pointsbetau", "unibet", "ladbrokes_au",
     "betfair_ex_au", "neds", "bluebet",

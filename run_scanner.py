@@ -11,49 +11,9 @@ from config import (
     FEATURE_PATH, MODEL_DIR, FEATURE_COLS,
     INITIAL_BANKROLL, EDGE_THRESHOLD,
 )
-from features import build_elo, build_rolling_features
+from features import build_current_match_features
 from scanner import fetch_odds, parse_odds, scan_value_bets
 from tracker import BetTracker
-
-
-def build_current_features(feature_df: pd.DataFrame,
-                           home_team: str, away_team: str) -> dict:
-    """Extract latest features for a given matchup from historical data.
-
-    Uses the most recent feature values for each team.
-    """
-    # Get last row where this team played at home / away
-    home_rows = feature_df[feature_df["home_team"] == home_team]
-    away_rows = feature_df[feature_df["away_team"] == away_team]
-
-    if home_rows.empty or away_rows.empty:
-        return None
-
-    last_home = home_rows.iloc[-1]
-    last_away = away_rows.iloc[-1]
-
-    # Build feature dict from latest data
-    features = {
-        "elo_diff": last_home.get("elo_home", 1500) - last_away.get("elo_away", 1500),
-        "elo_prob": last_home.get("elo_prob", 0.5),
-        "form_home_5": last_home.get("form_home_5", 0.5),
-        "form_away_5": last_away.get("form_away_5", 0.5),
-        "win_pct_home_10": last_home.get("win_pct_home_10", 0.5),
-        "win_pct_away_10": last_away.get("win_pct_away_10", 0.5),
-        "venue_exp_home": last_home.get("venue_exp_home", 0),
-        "venue_exp_away": last_away.get("venue_exp_away", 0),
-        "rest_days_home": last_home.get("rest_days_home", 7),
-        "rest_days_away": last_away.get("rest_days_away", 7),
-        "h2h_home_win_pct": last_home.get("h2h_home_win_pct", 0.5),
-        "season_round": 1,  # default for upcoming
-        "margin_ewma_home": last_home.get("margin_ewma_home", 0),
-        "margin_ewma_away": last_away.get("margin_ewma_away", 0),
-        "scoring_ewma_home": last_home.get("scoring_ewma_home", 80),
-        "scoring_ewma_away": last_away.get("scoring_ewma_away", 80),
-    }
-    features["form_diff"] = features["form_home_5"] - features["form_away_5"]
-    features["rest_diff"] = features["rest_days_home"] - features["rest_days_away"]
-    return features
 
 
 def main():
@@ -69,18 +29,18 @@ def main():
     args = parser.parse_args()
 
     # Load model
-    model_path = os.path.join(MODEL_DIR, "lgb_calibrated.pkl")
+    model_path = os.path.join(MODEL_DIR, "model_bundle.pkl")
     if not os.path.exists(model_path):
         print("No trained model found. Run model.py or run_backtest.py first.")
         return
 
-    model = joblib.load(model_path)
+    predictor = joblib.load(model_path)
 
-    # Load feature matrix for current team stats
+    # Load feature matrix for historical data
     if not os.path.exists(FEATURE_PATH):
         print("No feature matrix found. Run features.py first.")
         return
-    feature_df = pd.read_parquet(FEATURE_PATH)
+    history_df = pd.read_parquet(FEATURE_PATH)
 
     # Fetch odds
     try:
@@ -102,23 +62,28 @@ def main():
     # Build model predictions for each matchup
     model_probs = {}
     for _, row in odds_df.iterrows():
-        feats = build_current_features(feature_df, row["home_team"], row["away_team"])
+        feats = build_current_match_features(
+            history_df,
+            home_team=row["home_team"],
+            away_team=row["away_team"],
+            odds_home=row["best_home_odds"],
+            odds_away=row["best_away_odds"],
+        )
         if feats is None:
             continue
-        X = pd.DataFrame([feats])[FEATURE_COLS].values
-        prob = model.predict_proba(X)[0, 1]
-        model_probs[(row["home_team"], row["away_team"])] = prob
+        X = pd.DataFrame([feats])[FEATURE_COLS]
+        prob = predictor.predict_proba(X)[0, 1]
+        model_probs[(row["home_team"], row["away_team"])] = float(prob)
 
     # Scan for value
     value_bets = scan_value_bets(odds_df, model_probs, args.bankroll, args.edge)
 
     if value_bets.empty:
         print("\nNo value bets found above edge threshold.")
-        # Still show all matches with model probs
         print("\nAll matches:")
         for _, row in odds_df.iterrows():
             key = (row["home_team"], row["away_team"])
-            prob = model_probs.get(key, None)
+            prob = model_probs.get(key)
             if prob:
                 print(f"  {row['home_team']} v {row['away_team']}: "
                       f"model={prob:.1%}, "

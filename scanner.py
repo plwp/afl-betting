@@ -5,14 +5,13 @@ import json
 import time
 import hashlib
 import requests
-import numpy as np
 import pandas as pd
 from datetime import datetime
 
 from config import (
     ODDS_API_KEY, ODDS_API_BASE, ODDS_CACHE_DIR,
     ODDS_CACHE_TTL, AU_BOOKMAKERS, EDGE_THRESHOLD,
-    FEATURE_COLS, TEAM_NAME_MAP,
+    TEAM_NAME_MAP,
 )
 from sizing import kelly_stake, edge
 
@@ -40,7 +39,6 @@ def fetch_odds(force_refresh: bool = False) -> list:
 
     cache_file = _cache_path(params)
 
-    # Check cache
     if not force_refresh and os.path.exists(cache_file):
         mtime = os.path.getmtime(cache_file)
         if time.time() - mtime < ODDS_CACHE_TTL:
@@ -49,7 +47,6 @@ def fetch_odds(force_refresh: bool = False) -> list:
             print(f"Using cached odds ({int(time.time() - mtime)}s old)")
             return cached["data"]
 
-    # Fetch from API
     print("Fetching live odds from The Odds API...")
     resp = requests.get(ODDS_API_BASE, params=params, timeout=15)
     resp.raise_for_status()
@@ -58,7 +55,6 @@ def fetch_odds(force_refresh: bool = False) -> list:
     remaining = resp.headers.get("x-requests-remaining", "?")
     print(f"  {len(data)} events, {remaining} API requests remaining")
 
-    # Cache response
     with open(cache_file, "w") as f:
         json.dump({"timestamp": time.time(), "data": data}, f)
 
@@ -67,7 +63,6 @@ def fetch_odds(force_refresh: bool = False) -> list:
 
 def _normalize_api_team(name: str) -> str:
     """Normalize team names from Odds API to our canonical form."""
-    # The Odds API uses slightly different names
     api_map = {
         "Brisbane Lions": "Brisbane",
         "Greater Western Sydney Giants": "GWS Giants",
@@ -96,6 +91,8 @@ def parse_odds(events: list) -> pd.DataFrame:
 
         for bm in event.get("bookmakers", []):
             bm_key = bm.get("key", "")
+            if AU_BOOKMAKERS and bm_key not in AU_BOOKMAKERS:
+                continue
             for market in bm.get("markets", []):
                 if market.get("key") != "h2h":
                     continue
@@ -126,17 +123,7 @@ def scan_value_bets(odds_df: pd.DataFrame,
                     model_probs: dict,
                     bankroll: float,
                     edge_threshold: float = EDGE_THRESHOLD) -> pd.DataFrame:
-    """Find +EV bets by comparing model probs to market odds.
-
-    Args:
-        odds_df: DataFrame from parse_odds().
-        model_probs: dict mapping (home_team, away_team) -> home_win_prob.
-        bankroll: Current bankroll for Kelly sizing.
-        edge_threshold: Minimum edge to flag a bet.
-
-    Returns:
-        DataFrame of value bets.
-    """
+    """Find +EV bets — at most one side per match (best edge wins)."""
     value_bets = []
 
     for _, row in odds_df.iterrows():
@@ -146,40 +133,44 @@ def scan_value_bets(odds_df: pd.DataFrame,
 
         prob_home = model_probs[key]
         prob_away = 1 - prob_home
+        candidates = []
 
-        # Home side
         if row["best_home_odds"] > 0:
             e = edge(prob_home, row["best_home_odds"])
             if e > edge_threshold:
                 stake = kelly_stake(prob_home, row["best_home_odds"], bankroll)
-                value_bets.append({
-                    "match": f"{row['home_team']} v {row['away_team']}",
-                    "side": row["home_team"],
-                    "model_prob": prob_home,
-                    "implied_prob": 1 / row["best_home_odds"],
-                    "best_odds": row["best_home_odds"],
-                    "bookmaker": row["best_home_bookie"],
-                    "edge": e,
-                    "kelly_stake": stake,
-                    "commence": row["commence_time"],
-                })
+                if stake > 0:
+                    candidates.append({
+                        "match": f"{row['home_team']} v {row['away_team']}",
+                        "side": row["home_team"],
+                        "model_prob": prob_home,
+                        "implied_prob": 1 / row["best_home_odds"],
+                        "best_odds": row["best_home_odds"],
+                        "bookmaker": row["best_home_bookie"],
+                        "edge": e,
+                        "kelly_stake": stake,
+                        "commence": row["commence_time"],
+                    })
 
-        # Away side
         if row["best_away_odds"] > 0:
             e = edge(prob_away, row["best_away_odds"])
             if e > edge_threshold:
                 stake = kelly_stake(prob_away, row["best_away_odds"], bankroll)
-                value_bets.append({
-                    "match": f"{row['home_team']} v {row['away_team']}",
-                    "side": row["away_team"],
-                    "model_prob": prob_away,
-                    "implied_prob": 1 / row["best_away_odds"],
-                    "best_odds": row["best_away_odds"],
-                    "bookmaker": row["best_away_bookie"],
-                    "edge": e,
-                    "kelly_stake": stake,
-                    "commence": row["commence_time"],
-                })
+                if stake > 0:
+                    candidates.append({
+                        "match": f"{row['home_team']} v {row['away_team']}",
+                        "side": row["away_team"],
+                        "model_prob": prob_away,
+                        "implied_prob": 1 / row["best_away_odds"],
+                        "best_odds": row["best_away_odds"],
+                        "bookmaker": row["best_away_bookie"],
+                        "edge": e,
+                        "kelly_stake": stake,
+                        "commence": row["commence_time"],
+                    })
+
+        if candidates:
+            value_bets.append(max(candidates, key=lambda b: (b["edge"], b["model_prob"])))
 
     result = pd.DataFrame(value_bets)
     if not result.empty:
