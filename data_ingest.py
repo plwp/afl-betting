@@ -100,9 +100,15 @@ def merge_data(matches: pd.DataFrame, odds: pd.DataFrame) -> pd.DataFrame:
     merged["implied_prob_home"] = 1.0 / merged["odds_home"]
     merged["implied_prob_away"] = 1.0 / merged["odds_away"]
     # Normalize to remove overround
-    total = merged["implied_prob_home"] + merged["implied_prob_away"]
-    merged["market_prob_home"] = merged["implied_prob_home"] / total
-    merged["market_prob_away"] = merged["implied_prob_away"] / total
+    merged["market_overround"] = (
+        merged["implied_prob_home"] + merged["implied_prob_away"]
+    )
+    merged["market_prob_home"] = (
+        merged["implied_prob_home"] / merged["market_overround"]
+    )
+    merged["market_prob_away"] = (
+        merged["implied_prob_away"] / merged["market_overround"]
+    )
 
     merged = merged.sort_values("date").reset_index(drop=True)
     return merged

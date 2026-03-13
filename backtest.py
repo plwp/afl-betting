@@ -1,196 +1,180 @@
 """Walk-forward backtesting engine."""
 
+import matplotlib
 import numpy as np
 import pandas as pd
-import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.frozen import FrozenEstimator
-import lightgbm as lgb
 
-from config import (
-    FEATURE_COLS, ELO_K, KELLY_FRACTION, MAX_BET_FRACTION,
-    MIN_STAKE, EDGE_THRESHOLD, INITIAL_BANKROLL,
-)
-from sizing import kelly_stake, edge
+from config import EDGE_THRESHOLD, FEATURE_COLS, INITIAL_BANKROLL, MIN_STAKE
+from model import fit_model_bundle
+from sizing import edge, kelly_stake
 
 
-def walk_forward_backtest(df: pd.DataFrame,
-                          start_year: int = 2015,
-                          end_year: int = 2024,
-                          initial_bankroll: float = INITIAL_BANKROLL,
-                          edge_threshold: float = EDGE_THRESHOLD) -> dict:
-    """Walk-forward backtest with yearly retraining.
+def _select_bet(row: pd.Series, prob_home: float, bankroll: float, edge_threshold: float):
+    """Choose at most one side per match to avoid unrealistic double exposure."""
+    candidates = []
 
-    For each year Y in [start_year, end_year]:
-      - Train on all data up to Y-2
-      - Calibrate on Y-1
-      - Bet on Y
+    odds_home = row.get("odds_home")
+    if odds_home is not None and not pd.isna(odds_home):
+        home_edge = edge(prob_home, odds_home)
+        if home_edge > edge_threshold:
+            stake = kelly_stake(prob_home, odds_home, bankroll)
+            if stake > 0:
+                candidates.append(
+                    {
+                        "side": "home",
+                        "model_prob": prob_home,
+                        "odds": odds_home,
+                        "edge": home_edge,
+                        "stake": stake,
+                        "won": row["home_win"] == 1,
+                        "odds_close": row.get("odds_home_close", odds_home),
+                    }
+                )
 
-    Returns dict with results and bet log.
-    """
-    bankroll = initial_bankroll
+    odds_away = row.get("odds_away")
+    prob_away = 1.0 - prob_home
+    if odds_away is not None and not pd.isna(odds_away):
+        away_edge = edge(prob_away, odds_away)
+        if away_edge > edge_threshold:
+            stake = kelly_stake(prob_away, odds_away, bankroll)
+            if stake > 0:
+                candidates.append(
+                    {
+                        "side": "away",
+                        "model_prob": prob_away,
+                        "odds": odds_away,
+                        "edge": away_edge,
+                        "stake": stake,
+                        "won": row["home_win"] == 0,
+                        "odds_close": row.get("odds_away_close", odds_away),
+                    }
+                )
+
+    if not candidates:
+        return None
+
+    chosen = max(candidates, key=lambda item: (item["edge"], item["model_prob"]))
+    if pd.isna(chosen["odds_close"]):
+        chosen["odds_close"] = chosen["odds"]
+    return chosen
+
+
+def walk_forward_backtest(
+    df: pd.DataFrame,
+    start_year: int = 2015,
+    end_year: int = 2024,
+    initial_bankroll: float = INITIAL_BANKROLL,
+    edge_threshold: float = EDGE_THRESHOLD,
+) -> dict:
+    """Walk-forward backtest with yearly retraining and realistic bet selection."""
+    bankroll = float(initial_bankroll)
     bet_log = []
     bankroll_history = [(df[df["year"] == start_year]["date"].min(), bankroll)]
 
     for year in range(start_year, end_year + 1):
-        train_data = df[df["year"] <= year - 2]
-        cal_data = df[df["year"] == year - 1]
-        test_data = df[df["year"] == year]
+        train_data = df[df["year"] <= year - 2].copy()
+        cal_data = df[df["year"] == year - 1].copy()
+        test_data = df[df["year"] == year].copy().sort_values("date", kind="mergesort")
 
-        if len(train_data) < 100 or len(cal_data) < 20 or len(test_data) == 0:
+        if len(train_data) < 100 or len(cal_data) < 40 or len(test_data) == 0:
             print(f"  Skipping {year}: insufficient data")
             continue
 
-        X_train = train_data[FEATURE_COLS]
-        y_train = train_data["home_win"].values
-        X_cal = cal_data[FEATURE_COLS]
-        y_cal = cal_data["home_win"].values
-
-        # Train LightGBM
-        model = lgb.LGBMClassifier(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=6,
-            num_leaves=31,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_samples=20,
-            random_state=42,
-            verbose=-1,
+        predictor, meta = fit_model_bundle(train_data, cal_data)
+        print(
+            f"  {year}: trained with {len(train_data)} train / {len(cal_data)} calibration "
+            f"rows using LightGBM params {meta['lgb']}"
         )
-        model.fit(X_train, y_train)
 
-        # Calibrate
-        cal_model = CalibratedClassifierCV(FrozenEstimator(model), method="isotonic")
-        cal_model.fit(X_cal, y_cal)
-
-        # Predict on test year
-        X_test = test_data[FEATURE_COLS]
-        probs = cal_model.predict_proba(X_test)[:, 1]
-
+        probs = predictor.predict_proba(test_data[FEATURE_COLS])[:, 1]
         year_bets = 0
-        year_pnl = 0
+        year_pnl = 0.0
 
-        for i, (idx, row) in enumerate(test_data.iterrows()):
-            prob_home = probs[i]
-            prob_away = 1 - prob_home
-            odds_home = row.get("odds_home", None)
-            odds_away = row.get("odds_away", None)
+        for idx, row in test_data.reset_index(drop=True).iterrows():
+            if bankroll < MIN_STAKE:
+                print(f"  Stopping in {year}: bankroll ${bankroll:.2f} below minimum stake")
+                break
 
-            # Try home bet
-            if odds_home is not None and not np.isnan(odds_home):
-                e_home = edge(prob_home, odds_home)
-                if e_home > edge_threshold:
-                    stake = kelly_stake(prob_home, odds_home, bankroll)
-                    if stake > 0:
-                        won = row["home_win"] == 1
-                        pnl = stake * (odds_home - 1) if won else -stake
-                        bankroll += pnl
-                        year_pnl += pnl
-                        year_bets += 1
-                        # CLV: closing line value
-                        odds_close = row.get("odds_home_close", odds_home)
-                        if pd.isna(odds_close):
-                            odds_close = odds_home
-                        clv = (1 / odds_close) - (1 / odds_home)
-                        bet_log.append({
-                            "date": row["date"],
-                            "year": year,
-                            "home_team": row["home_team"],
-                            "away_team": row["away_team"],
-                            "side": "home",
-                            "model_prob": prob_home,
-                            "odds": odds_home,
-                            "odds_close": odds_close,
-                            "edge": e_home,
-                            "stake": stake,
-                            "won": won,
-                            "pnl": pnl,
-                            "clv": clv,
-                            "bankroll": bankroll,
-                        })
-                        bankroll_history.append((row["date"], bankroll))
+            candidate = _select_bet(row, float(probs[idx]), bankroll, edge_threshold)
+            if candidate is None:
+                continue
 
-            # Try away bet
-            if odds_away is not None and not np.isnan(odds_away):
-                e_away = edge(prob_away, odds_away)
-                if e_away > edge_threshold:
-                    stake = kelly_stake(prob_away, odds_away, bankroll)
-                    if stake > 0:
-                        won = row["home_win"] == 0
-                        pnl = stake * (odds_away - 1) if won else -stake
-                        bankroll += pnl
-                        year_pnl += pnl
-                        year_bets += 1
-                        odds_close = row.get("odds_away_close", odds_away)
-                        if pd.isna(odds_close):
-                            odds_close = odds_away
-                        clv = (1 / odds_close) - (1 / odds_away)
-                        bet_log.append({
-                            "date": row["date"],
-                            "year": year,
-                            "home_team": row["home_team"],
-                            "away_team": row["away_team"],
-                            "side": "away",
-                            "model_prob": prob_away,
-                            "odds": odds_away,
-                            "odds_close": odds_close,
-                            "edge": e_away,
-                            "stake": stake,
-                            "won": won,
-                            "pnl": pnl,
-                            "clv": clv,
-                            "bankroll": bankroll,
-                        })
-                        bankroll_history.append((row["date"], bankroll))
+            pnl = candidate["stake"] * (candidate["odds"] - 1) if candidate["won"] else -candidate["stake"]
+            bankroll += pnl
+            year_pnl += pnl
+            year_bets += 1
 
-        print(f"  {year}: {year_bets} bets, P&L ${year_pnl:+.2f}, "
-              f"Bankroll ${bankroll:.2f}")
+            clv = (1 / candidate["odds_close"]) - (1 / candidate["odds"])
+            bet_log.append(
+                {
+                    "date": row["date"],
+                    "year": year,
+                    "home_team": row["home_team"],
+                    "away_team": row["away_team"],
+                    "side": candidate["side"],
+                    "model_prob": candidate["model_prob"],
+                    "market_prob_home": row["market_prob_home"],
+                    "odds": candidate["odds"],
+                    "odds_close": candidate["odds_close"],
+                    "edge": candidate["edge"],
+                    "stake": candidate["stake"],
+                    "won": candidate["won"],
+                    "pnl": pnl,
+                    "clv": clv,
+                    "bankroll": bankroll,
+                }
+            )
+            bankroll_history.append((row["date"], bankroll))
+
+        print(f"  {year}: {year_bets} bets, P&L ${year_pnl:+.2f}, Bankroll ${bankroll:.2f}")
+        if bankroll < MIN_STAKE:
+            break
 
     bets_df = pd.DataFrame(bet_log)
     return _compute_summary(bets_df, bankroll_history, initial_bankroll)
 
 
-def _compute_summary(bets_df: pd.DataFrame,
-                     bankroll_history: list,
-                     initial_bankroll: float) -> dict:
+def _compute_summary(
+    bets_df: pd.DataFrame,
+    bankroll_history: list,
+    initial_bankroll: float,
+) -> dict:
     """Compute backtest summary statistics."""
     if bets_df.empty:
         print("No bets placed.")
         return {"bets_df": bets_df, "bankroll_history": bankroll_history}
 
-    total_staked = bets_df["stake"].sum()
-    total_pnl = bets_df["pnl"].sum()
-    n_bets = len(bets_df)
-    n_wins = bets_df["won"].sum()
+    total_staked = float(bets_df["stake"].sum())
+    total_pnl = float(bets_df["pnl"].sum())
+    n_bets = int(len(bets_df))
+    n_wins = int(bets_df["won"].sum())
     win_rate = n_wins / n_bets
 
-    roi = total_pnl / initial_bankroll
-    yield_pct = total_pnl / total_staked if total_staked > 0 else 0
-    avg_clv = bets_df["clv"].mean()
+    roi = total_pnl / total_staked if total_staked > 0 else 0.0
+    bankroll_return = (bankroll_history[-1][1] / initial_bankroll) - 1 if initial_bankroll else 0.0
+    avg_clv = float(bets_df["clv"].mean())
 
-    # Max drawdown
-    bankroll_series = pd.Series([b for _, b in bankroll_history])
+    bankroll_series = pd.Series([b for _, b in bankroll_history], dtype=float)
     peak = bankroll_series.cummax()
-    drawdown = (bankroll_series - peak) / peak
-    max_dd = drawdown.min()
+    drawdown = (bankroll_series - peak) / peak.replace(0, np.nan)
+    max_dd = float(drawdown.min())
 
-    # Sharpe-like ratio (daily returns)
-    bets_df["return"] = bets_df["pnl"] / bets_df["stake"]
-    daily_returns = bets_df.groupby("date")["return"].mean()
-    sharpe = (daily_returns.mean() / daily_returns.std() * np.sqrt(len(daily_returns))
-              if daily_returns.std() > 0 else 0)
+    daily_pnl = bets_df.groupby("date")["pnl"].sum()
+    sharpe = 0.0
+    if len(daily_pnl) > 1 and daily_pnl.std(ddof=0) > 0:
+        sharpe = float((daily_pnl.mean() / daily_pnl.std(ddof=0)) * np.sqrt(len(daily_pnl)))
 
     summary = {
         "total_bets": n_bets,
-        "wins": int(n_wins),
+        "wins": n_wins,
         "win_rate": win_rate,
         "total_staked": total_staked,
         "total_pnl": total_pnl,
         "roi": roi,
-        "yield_pct": yield_pct,
+        "bankroll_return": bankroll_return,
         "avg_clv": avg_clv,
         "max_drawdown": max_dd,
         "sharpe": sharpe,
@@ -198,16 +182,16 @@ def _compute_summary(bets_df: pd.DataFrame,
     }
 
     print("\n=== Backtest Results ===")
-    print(f"  Total Bets:     {n_bets}")
-    print(f"  Win Rate:       {win_rate:.1%}")
-    print(f"  Total Staked:   ${total_staked:,.2f}")
-    print(f"  Total P&L:      ${total_pnl:+,.2f}")
-    print(f"  ROI:            {roi:+.1%}")
-    print(f"  Yield:          {yield_pct:+.1%}")
-    print(f"  Avg CLV:        {avg_clv:+.4f}")
-    print(f"  Max Drawdown:   {max_dd:.1%}")
-    print(f"  Sharpe-like:    {sharpe:.2f}")
-    print(f"  Final Bankroll: ${bankroll_history[-1][1]:,.2f}")
+    print(f"  Total Bets:       {n_bets}")
+    print(f"  Win Rate:         {win_rate:.1%}")
+    print(f"  Total Staked:     ${total_staked:,.2f}")
+    print(f"  Total P&L:        ${total_pnl:+,.2f}")
+    print(f"  ROI on Stakes:    {roi:+.1%}")
+    print(f"  Bankroll Return:  {bankroll_return:+.1%}")
+    print(f"  Avg CLV:          {avg_clv:+.4f}")
+    print(f"  Max Drawdown:     {max_dd:.1%}")
+    print(f"  Sharpe-like:      {sharpe:.2f}")
+    print(f"  Final Bankroll:   ${bankroll_history[-1][1]:,.2f}")
 
     return {
         "summary": summary,

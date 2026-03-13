@@ -96,6 +96,8 @@ def parse_odds(events: list) -> pd.DataFrame:
 
         for bm in event.get("bookmakers", []):
             bm_key = bm.get("key", "")
+            if AU_BOOKMAKERS and bm_key not in AU_BOOKMAKERS:
+                continue
             for market in bm.get("markets", []):
                 if market.get("key") != "h2h":
                     continue
@@ -147,39 +149,46 @@ def scan_value_bets(odds_df: pd.DataFrame,
         prob_home = model_probs[key]
         prob_away = 1 - prob_home
 
+        candidates = []
+
         # Home side
         if row["best_home_odds"] > 0:
             e = edge(prob_home, row["best_home_odds"])
             if e > edge_threshold:
                 stake = kelly_stake(prob_home, row["best_home_odds"], bankroll)
-                value_bets.append({
-                    "match": f"{row['home_team']} v {row['away_team']}",
-                    "side": row["home_team"],
-                    "model_prob": prob_home,
-                    "implied_prob": 1 / row["best_home_odds"],
-                    "best_odds": row["best_home_odds"],
-                    "bookmaker": row["best_home_bookie"],
-                    "edge": e,
-                    "kelly_stake": stake,
-                    "commence": row["commence_time"],
-                })
+                if stake > 0:
+                    candidates.append({
+                        "match": f"{row['home_team']} v {row['away_team']}",
+                        "side": row["home_team"],
+                        "model_prob": prob_home,
+                        "implied_prob": 1 / row["best_home_odds"],
+                        "best_odds": row["best_home_odds"],
+                        "bookmaker": row["best_home_bookie"],
+                        "edge": e,
+                        "kelly_stake": stake,
+                        "commence": row["commence_time"],
+                    })
 
         # Away side
         if row["best_away_odds"] > 0:
             e = edge(prob_away, row["best_away_odds"])
             if e > edge_threshold:
                 stake = kelly_stake(prob_away, row["best_away_odds"], bankroll)
-                value_bets.append({
-                    "match": f"{row['home_team']} v {row['away_team']}",
-                    "side": row["away_team"],
-                    "model_prob": prob_away,
-                    "implied_prob": 1 / row["best_away_odds"],
-                    "best_odds": row["best_away_odds"],
-                    "bookmaker": row["best_away_bookie"],
-                    "edge": e,
-                    "kelly_stake": stake,
-                    "commence": row["commence_time"],
-                })
+                if stake > 0:
+                    candidates.append({
+                        "match": f"{row['home_team']} v {row['away_team']}",
+                        "side": row["away_team"],
+                        "model_prob": prob_away,
+                        "implied_prob": 1 / row["best_away_odds"],
+                        "best_odds": row["best_away_odds"],
+                        "bookmaker": row["best_away_bookie"],
+                        "edge": e,
+                        "kelly_stake": stake,
+                        "commence": row["commence_time"],
+                    })
+
+        if candidates:
+            value_bets.append(max(candidates, key=lambda bet: (bet["edge"], bet["model_prob"])))
 
     result = pd.DataFrame(value_bets)
     if not result.empty:

@@ -75,12 +75,18 @@ FEATURE_COLS = [
     "elo_diff", "elo_prob",
     "form_home_5", "form_away_5", "form_diff",
     "win_pct_home_10", "win_pct_away_10",
+    "win_pct_diff",
     "venue_exp_home", "venue_exp_away",
+    "venue_exp_diff",
     "rest_days_home", "rest_days_away", "rest_diff",
     "h2h_home_win_pct",
     "season_round",
     "margin_ewma_home", "margin_ewma_away",
+    "margin_ewma_diff",
     "scoring_ewma_home", "scoring_ewma_away",
+    "scoring_ewma_diff",
+    "market_prob_home", "market_prob_away", "market_overround",
+    "market_elo_delta",
 ]
 
 # --- Odds API ---
