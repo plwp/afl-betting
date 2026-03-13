@@ -19,6 +19,14 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 MERGED_PATH = os.path.join(DATA_DIR, "afl_merged.parquet")
 FEATURE_PATH = os.path.join(DATA_DIR, "feature_matrix.parquet")
 ODDS_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".odds_cache")
+WEATHER_CACHE_DIR = os.path.join(DATA_DIR, "weather_cache")
+PLAYER_STATS_DIR = os.path.join(DATA_DIR, "player_stats")
+
+# --- Data Sources (Player Stats) ---
+PLAYER_CSV_URL = (
+    "https://raw.githubusercontent.com/akareen/AFL-Data-Analysis"
+    "/main/data/players/player_stats_{year}.csv"
+)
 
 # --- Team Name Mappings ---
 TEAM_NAME_MAP = {
@@ -95,6 +103,44 @@ VENUE_STATE = {
     "Marrara Oval": "NT", "TIO Stadium": "NT", "Traeger Park": "NT",
 }
 
+# --- Venue Coordinates (lat, long) for weather lookups ---
+VENUE_COORDS = {
+    "M.C.G.": (-37.820, 144.983),
+    "Docklands": (-37.816, 144.947),
+    "Marvel Stadium": (-37.816, 144.947),
+    "Kardinia Park": (-38.158, 144.354),
+    "GMHBA Stadium": (-38.158, 144.354),
+    "Eureka Stadium": (-37.563, 143.862),
+    "S.C.G.": (-33.892, 151.225),
+    "Stadium Australia": (-33.847, 151.063),
+    "Accor Stadium": (-33.847, 151.063),
+    "Sydney Showground": (-33.844, 151.067),
+    "ENGIE Stadium": (-33.844, 151.067),
+    "Giants Stadium": (-33.844, 151.067),
+    "Subiaco": (-31.944, 115.830),
+    "Perth Stadium": (-31.951, 115.889),
+    "Optus Stadium": (-31.951, 115.889),
+    "Domain Stadium": (-31.944, 115.830),
+    "Football Park": (-34.880, 138.496),
+    "Adelaide Oval": (-34.916, 138.596),
+    "Gabba": (-27.486, 153.038),
+    "Carrara": (-28.007, 153.366),
+    "People First Stadium": (-28.007, 153.366),
+    "Cazaly's Stadium": (-16.928, 145.745),
+    "Riverway Stadium": (-19.290, 146.730),
+    "York Park": (-41.424, 147.137),
+    "UTAS Stadium": (-41.424, 147.137),
+    "Bellerive Oval": (-42.874, 147.375),
+    "Blundstone Arena": (-42.874, 147.375),
+    "Manuka Oval": (-35.318, 149.135),
+    "Marrara Oval": (-12.432, 130.846),
+    "TIO Stadium": (-12.432, 130.846),
+    "Traeger Park": (-23.700, 133.870),
+}
+
+# Venues with retractable roofs (weather-neutral)
+ROOFED_VENUES = {"Docklands", "Marvel Stadium"}
+
 # Approximate flight hours between states (symmetric)
 TRAVEL_HOURS = {
     ("VIC", "SA"): 1.0, ("VIC", "QLD"): 2.5, ("VIC", "WA"): 4.0,
@@ -125,6 +171,16 @@ FEATURE_COLS = [
     "season_round", "is_final",
     "margin_ewma_home", "margin_ewma_away", "margin_ewma_diff",
     "scoring_ewma_home", "scoring_ewma_away", "scoring_ewma_diff",
+    # Weather
+    "rain_mm", "wind_speed", "is_wet", "is_roofed",
+    # Squiggle consensus
+    "squiggle_prob_home",
+    # Team stats (enabled when team_stats.parquet exists)
+    # "disposals_home", "disposals_away", "disposals_diff",
+    # "contested_poss_home", "contested_poss_away", "contested_poss_diff",
+    # "clearances_home", "clearances_away", "clearances_diff",
+    # "inside50s_home", "inside50s_away", "inside50s_diff",
+    # "tackles_home", "tackles_away", "tackles_diff",
 ]
 
 # --- Odds API ---
