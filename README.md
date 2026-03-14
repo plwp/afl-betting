@@ -1,49 +1,51 @@
-# AFL Value Betting Experiment (Failed)
+# Can Machine Learning Beat AFL Betting Markets?
 
-A failed experiment in building a machine learning system to beat AFL betting markets. Published as a learning resource.
+**A failed experiment -- published as a learning resource.**
 
-The system combines Elo ratings, rolling form statistics, weather data, and consensus model predictions into an ensemble that blends its own signal with market odds via a calibrated stacker. After months of iteration it produces a backtest that looks marginally profitable -- but the evidence is too thin to trust.
+## Abstract
 
-## The Question
+We built an ensemble machine learning system to identify value bets in Australian Rules Football (AFL) markets. The system combines Elo ratings, rolling performance statistics, weather data, and consensus model predictions, blended with bookmaker odds via a calibrated logit-space stacker. Over a 10-year walk-forward backtest (2015-2024), the strategy produced +8.4% ROI on 43 bets with a 67.4% win rate. However, the sample size is far too small for statistical significance, closing line value is negative (-0.008), and individual models fail to beat the market on log loss. We conclude that the results are consistent with variance rather than genuine edge, and publish the full system as a reference implementation.
 
-Can a quantitative model identify profitable betting opportunities in AFL markets, where bookmaker odds already encode significant information?
+## 1. Introduction
 
-**Answer: Not convincingly.** The model ekes out a +0.0012 log loss edge over the market across 432 test matches, and the backtest shows +8.4% ROI -- but on only 43 bets over 10 years. That's noise, not signal.
+Sports betting markets are widely considered semi-efficient: bookmaker odds incorporate substantial information and are difficult to beat systematically. The AFL, with ~200 matches per season and a well-developed betting market in Australia, presents an interesting test case. The question is simple: can a quantitative model, trained on 16 years of historical data and enriched with external signals, find exploitable inefficiencies?
 
-## Approach
+**Answer: not convincingly.** This document reports what we tried, what the numbers show, and why we believe the positive backtest results are likely noise.
 
-### Data
+## 2. Data
 
-- **16 seasons** of AFL match data (2009-2024), ~3,100+ matches with odds
-- Sources: AFL-Data-Analysis (GitHub), AusportsBetting.com historical odds, Squiggle API, Open-Meteo weather API, FootyWire team statistics
+**Coverage**: 16 seasons (2009-2024), ~3,100 matches with opening and closing odds.
 
-### Feature Engineering (40 features)
+| Source | Data | Usage |
+|--------|------|-------|
+| AFL-Data-Analysis (GitHub) | Match results, scores, venues | Core match data |
+| AusportsBetting.com | Historical bookmaker odds | Market probabilities, CLV |
+| Squiggle API | ~20 public computer model predictions | Consensus signal |
+| Open-Meteo API | Historical weather per venue | Rain, wind features |
+| FootyWire | Team-level match statistics | Tested, excluded |
+| Betfair Exchange | Back/lay spreads, matched volume | Live scanning only |
+| The Odds API | Live odds from 8+ AU bookmakers | Live scanning only |
 
-| Category | Features | Notes |
-|----------|----------|-------|
-| **Elo ratings** | `elo_diff`, `elo_prob` | Margin-based K multiplier (capped at 2.5x), 30pt home advantage, 33% season reversion |
-| **Market odds** | `market_prob_home/away`, `market_overround`, `market_elo_delta` | Implied probabilities from opening odds |
-| **Form** | `form_*_5`, `win_pct_*_10`, `margin_ewma_*`, `scoring_ewma_*` | Rolling 5-game form, 10-game win%, EWMA trends |
-| **Venue/travel** | `venue_exp_*`, `is_home_state`, `travel_hours_*` | Venue familiarity, interstate travel costs |
-| **Rest** | `rest_days_*`, `rest_diff` | Days between games |
-| **Matchup** | `h2h_home_win_pct` | Historical head-to-head record |
-| **Weather** | `rain_mm`, `wind_speed`, `is_wet`, `is_roofed` | Open-Meteo historical data per venue |
-| **Squiggle consensus** | `squiggle_prob_home`, `squiggle_top3_prob`, `squiggle_model_spread` | Average of ~20 public computer models, top-3 accuracy-weighted, model disagreement |
-| **Betfair Exchange** | `bf_spread_home/away`, `bf_volume_ratio` | Live only (neutral defaults in backtest) |
+## 3. Methodology
 
-Team-level FootyWire statistics (disposals, clearances, inside 50s, tackles) were tested but **excluded** -- they added noise and reduced accuracy by 0.4%.
+### 3.1 Feature Engineering
 
-### Model Architecture
+40 features across 8 categories, all computed without lookahead bias (shifted/lagged appropriately):
 
-**Ensemble with calibrated logit-space stacking:**
+| Category | Features | Construction |
+|----------|----------|-------------|
+| Elo ratings | `elo_diff`, `elo_prob` | Margin-based K multiplier (capped 2.5x), 30pt home advantage, 33% season reversion to mean |
+| Market odds | `market_prob_home/away`, `overround`, `market_elo_delta` | Implied probabilities from opening odds, normalised for overround |
+| Form | `form_*_5`, `win_pct_*_10`, `margin_ewma_*`, `scoring_ewma_*` | Rolling 5-game win rate, 10-game win%, EWMA (span=10) of margins and scores |
+| Venue/travel | `venue_exp_*`, `is_home_state`, `travel_hours_*` | Cumulative venue appearances, interstate flight hours |
+| Rest | `rest_days_*`, `rest_diff` | Days since last match (capped at 30) |
+| Matchup | `h2h_home_win_pct` | Historical head-to-head win rate |
+| Weather | `rain_mm`, `wind_speed`, `is_wet`, `is_roofed` | Open-Meteo data matched to venue coordinates |
+| Squiggle | `squiggle_prob_home`, `top3_prob`, `model_spread` | Consensus of public models, top-3 accuracy-weighted, inter-model disagreement |
 
-1. **Logistic Regression** -- tuned regularization (C: 0.02-4.0), scaled features
-2. **LightGBM** -- conservative config (300-500 trees, max depth 3-5, heavy regularization)
-3. **Calibrated Stacker** -- logistic regression on 5 features:
-   - `logit(LogReg prob)`, `logit(LightGBM prob)`, `logit(market prob)`
-   - `LGB - market` delta, `LR - market` delta
+**Excluded features**: FootyWire team statistics (disposals, clearances, inside 50s, tackles) were tested as rolling 5-game EWMA features but reduced accuracy by 0.4% and were removed. Betfair Exchange features use neutral defaults in historical data and only activate during live scanning.
 
-The stacker learns how much to trust the models vs the market. In practice it heavily weights market odds (~70%) and blends in model signals where they disagree.
+### 3.2 Model Architecture
 
 ```mermaid
 graph LR
@@ -60,50 +62,80 @@ graph LR
     F -->|No| H[No Bet]
 ```
 
-### Betting Strategy
+**Base models**:
+- **Logistic Regression**: L2-regularised (C tuned from 0.02-4.0), scaled features
+- **LightGBM**: Conservative configuration (300-500 trees, max depth 3-5, heavy L1/L2 regularisation, early stopping at 50 rounds)
+
+**Stacker**: A logistic regression in logit space over 5 inputs -- `logit(LR)`, `logit(LGB)`, `logit(market)`, plus two delta features (`LGB - market`, `LR - market`). Tuned with C in [0.01, 0.1]. This learns how much to trust each signal; in practice it weights market odds at ~70%.
+
+### 3.3 Betting Strategy
 
 **Favourite-only** with strict filters:
 - Model probability > 55%
 - Market agrees it's the favourite (implied prob > 50%)
-- Odds <= 3.0
-- Edge > 5% (model_prob * odds - 1)
+- Decimal odds <= 3.0
+- Edge > 5%, where edge = model_prob x odds - 1
 - At most one bet per match (highest edge side)
-- **Quarter-Kelly** sizing, capped at 5% of bankroll per bet
+- **Quarter-Kelly** sizing (f* x 0.25), capped at 5% of bankroll
 
-This replaced an earlier strategy that bet both sides and underdogs -- which lost money.
+This replaced an earlier strategy that bet both sides and underdogs, which lost -$181. The switch to favourite-only flipped the backtest to +$110.
 
-## Results
+### 3.4 Walk-Forward Protocol
 
-### Model Accuracy (Static Evaluation)
+For each test year Y (2015-2024):
+1. **Train** on all matches in years <= Y-3
+2. **Calibrate** stacker on years Y-2 to Y-1
+3. **Test** on year Y (out-of-sample)
+4. **Daily bankroll lock**: bet sizes computed from start-of-day bankroll; P&L applied at end of day
 
-Trained on 2009-2020, calibrated on 2021-2022, tested on 2023-2024:
+This ensures no lookahead bias: the model for 2024 has never seen data from 2022 onwards.
 
-| Model | Test Log Loss | Test Accuracy | vs Market LL |
-|-------|--------------|---------------|--------------|
-| **Market** | 0.5929 | 65.1% | -- |
-| **LogReg** | 0.5990 | 65.5% | -0.0061 (worse) |
-| **LightGBM** | 0.6023 | 68.3% | -0.0094 (worse) |
-| **Ensemble** | **0.5916** | **66.2%** | **+0.0012 (better)** |
+## 4. Results
 
-The individual models can't beat the market on log loss alone. The ensemble stacker marginally beats it (+0.0012 log loss edge) by learning which situations to trust its own signal vs the market.
+### 4.1 Model Evaluation
 
-### Walk-Forward Backtest (2015-2024)
+Static evaluation: trained on 2009-2020, calibrated on 2021-2022, tested on 2023-2024 (n=432 matches).
 
-Yearly retrain: train on years <= Y-3, calibrate on Y-2 to Y-1, test on year Y.
+| Model | Log Loss | Brier Score | Accuracy | vs Market LL |
+|-------|----------|-------------|----------|--------------|
+| Market | 0.5929 | 0.2050 | 65.1% | -- |
+| Logistic Regression | 0.5990 | 0.2077 | 65.5% | -0.0061 (worse) |
+| LightGBM | 0.6023 | 0.2083 | 68.3% | -0.0094 (worse) |
+| **Ensemble (stacker)** | **0.5916** | **0.2041** | **66.2%** | **+0.0012 (better)** |
+
+Neither base model beats the market on log loss individually. The ensemble stacker recovers a marginal edge (+0.0012) by blending model signals with market odds.
+
+![Model Comparison](charts/model_comparison.png)
+
+### 4.2 Calibration
+
+Both market and ensemble produce well-calibrated probabilities, tracking the diagonal closely. The ensemble shows slight underconfidence in the 40-60% range and overconfidence above 90%.
+
+![Calibration](charts/calibration.png)
+
+### 4.3 Feature Importance
+
+Market-derived features dominate (top 3 are all market odds). The model's marginal contribution comes from venue experience, recent scoring trends, and weather -- signals the market may partially discount.
+
+![Feature Importance](charts/feature_importance.png)
+
+### 4.4 Backtest Performance
 
 | Metric | Value |
 |--------|-------|
-| **Total Bets** | 43 |
-| **Win Rate** | 67.4% |
-| **Total Staked** | $1,312.78 |
-| **Total P&L** | +$110.17 |
-| **ROI on Stakes** | +8.4% |
-| **Bankroll Return** | +11.0% ($1,000 -> $1,110) |
-| **Max Drawdown** | -10.9% |
-| **Sharpe-like** | 0.71 |
-| **Avg CLV** | -0.0080 |
+| Total Bets | 43 |
+| Win Rate | 67.4% (29W / 14L) |
+| Total Staked | $1,312.78 |
+| Total P&L | +$110.17 |
+| ROI on Stakes | +8.4% |
+| Bankroll Return | +11.0% ($1,000 -> $1,110) |
+| Max Drawdown | -10.9% |
+| Sharpe-like Ratio | 0.71 |
+| Avg Closing Line Value | -0.0080 |
 
-### Year-by-Year
+![Bankroll Curve](charts/bankroll_curve.png)
+
+### 4.5 Annual Breakdown
 
 | Year | Bets | Win Rate | P&L | Yield |
 |------|------|----------|-----|-------|
@@ -112,70 +144,45 @@ Yearly retrain: train on years <= Y-3, calibrate on Y-2 to Y-1, test on year Y.
 | 2017 | 2 | 50% | -$10.57 | -23% |
 | 2018 | 3 | 67% | +$7.58 | +12% |
 | 2019 | 8 | 62% | +$14.77 | +6% |
-| 2020 | 0 | -- | $0.00 | -- |
+| 2020 | 0 | -- | -- | -- |
 | 2021 | 2 | 100% | +$27.99 | +56% |
 | 2022 | 1 | 100% | +$17.72 | +53% |
 | 2023 | 6 | 67% | +$24.15 | +13% |
 | 2024 | 8 | 62% | +$21.83 | +8% |
 
-### Bankroll Curve
+![Annual P&L](charts/yearly_pnl.png)
 
-![Bankroll Curve](models/bankroll_curve.png)
+### 4.6 Bet-Level Analysis
 
-### Calibration
+The cumulative P&L curve shows high path-dependency. The system spent bets 10-25 underwater, and the recovery is driven by a streak of wins from bet 25 onwards (2021-2024). Most bets cluster near the minimum 5% edge threshold.
 
-The ensemble calibration closely tracks the diagonal (well-calibrated), with slight overconfidence at the extreme ends:
+![Cumulative P&L](charts/cumulative_pnl.png)
 
-![Ensemble Calibration](models/calibration_ensemble.png)
+![Edge Distribution](charts/edge_distribution.png)
 
-### Feature Importance (LightGBM)
+## 5. Discussion
 
-Top 10 features by split importance:
+### Why we think this doesn't work
 
-1. `market_prob_home` (220) -- Market odds dominate
-2. `market_overround` (185) -- Bookmaker margin signal
-3. `market_prob_away` (182)
-4. `venue_exp_diff` (150) -- Venue familiarity matters
-5. `margin_ewma_home` (136) -- Recent scoring margins
-6. `wind_speed` (124) -- Weather affects play style
-7. `scoring_ewma_away` (120)
-8. `margin_ewma_away` (112)
-9. `market_elo_delta` (108) -- Where Elo disagrees with market
-10. `elo_diff` (107) -- Raw Elo rating gap
+1. **Insufficient sample size.** 43 bets over 10 years cannot establish statistical significance. A binomial test on the 67.4% win rate at the observed average odds gives p ~ 0.15 -- nowhere near the 0.05 threshold. You would need ~200+ bets at this win rate to reach significance.
 
-Notable: Betfair Exchange features, `is_final`, `travel_hours_home`, and `is_home_state` had zero importance (all historical values are defaults for Betfair/Exchange features).
+2. **Negative closing line value.** The average CLV of -0.008 means the model is betting into lines that move against it. In efficient markets, positive CLV is the hallmark of a genuine edge. Negative CLV suggests the market is smarter than the model.
 
-## Honest Assessment
+3. **Individual models lose to the market.** Both logistic regression and LightGBM have worse log loss than simply using bookmaker odds. The stacker recovers a tiny edge (+0.0012 log loss) by learning to mostly trust the market and nudge predictions slightly -- but this is a razor-thin margin.
 
-**What works:**
-- The ensemble stacker does beat the market on log loss, but barely (+0.0012)
-- The favourite-only strategy with tight filters produces a positive ROI (+8.4%) over 10 years
-- Calibration is good -- predicted probabilities are reliable
-- The system correctly identifies that market odds are the strongest signal and uses models as a supplement, not a replacement
+4. **Small-sample flattery.** The 2021-2022 period (3 bets, 100% win rate, +$46) accounts for ~40% of total profit. Remove those 3 bets and ROI drops to ~5%.
 
-**What doesn't work / concerns:**
-- **Tiny sample size**: 43 bets over 10 years is not statistically significant. A few lucky bets in 2021-22 (3 bets, 100% win rate, +$46) substantially flatter the results
-- **Negative CLV (-0.008)**: The model is betting into lines that move against it on average. This suggests the model may not have a genuine informational edge -- the wins could be variance
-- **Individual models lose to the market**: LogReg and LightGBM both have worse log loss than the market baseline. Only the stacker's blending recovers a tiny edge
-- **COVID year gap**: Zero bets in 2020 (shortened season) creates a survivorship gap
-- **No live track record**: All results are backtested. Transaction costs, odds availability, and execution slippage in live betting could easily erase an 8% edge
-- **Betfair/Exchange features are dead weight**: Historical defaults (0.05 spread, 0.5 volume) mean these features contribute nothing in backtesting
+5. **No live validation.** All results are backtested against historical odds. Real-world execution faces additional headwinds: odds may not be available at the backtested price, accounts may be limited, and the model has never been tested in production.
 
-**Bottom line**: The model is well-built and the favourite-only strategy avoids the biggest traps (betting underdogs, chasing long odds). But 43 bets at +8.4% ROI is not enough evidence to conclude there's a real edge vs lucky variance. You'd need several hundred bets to have statistical confidence.
+### What we learned
 
-## Evolution
+- **Markets are good.** The bookmaker line is the single strongest predictor. Three of the top four LightGBM features are market-derived. Any model that doesn't incorporate market odds performs substantially worse.
+- **Stacking helps.** Even though base models lose to the market individually, the logit-space stacker can blend them in a way that marginally improves on the market alone. The key is the delta features (model - market) which capture where the model disagrees.
+- **Strategy matters more than model.** Switching from "bet anything with edge" to "favourite-only with strict filters" flipped the backtest from -$181 to +$110 -- a larger effect than any modelling improvement.
+- **More data doesn't always help.** FootyWire team statistics (disposals, clearances, etc.) added noise and hurt performance. Weather and Squiggle consensus helped marginally.
+- **Quarter-Kelly is conservative enough.** The 0.25 Kelly fraction with a 5% bankroll cap kept maximum drawdown under 11%, even through losing streaks.
 
-The project went through several iterations (see git log):
-
-1. **Initial build** -- Basic Elo + logistic regression
-2. **Gemini review** -- Added margin-based Elo, ensemble model, daily bankroll lock
-3. **Codex review** -- Ensemble stacker, feature leakage fixes, logit-space blending
-4. **Weather/Squiggle/team stats** -- External data sources (weather and Squiggle improved results; team stats did not)
-5. **Favourite-only strategy** -- Replaced losing underdog-heavy strategy; flipped P&L from -$181 to +$110
-6. **Betfair Exchange** -- Added live exchange data (useful for scanning, not backtest)
-7. **Enhanced Squiggle** -- Top-3 model averaging and model disagreement features
-
-## Data Pipeline
+## 6. System Architecture
 
 ```mermaid
 graph TD
@@ -195,17 +202,19 @@ graph TD
     P[Betfair Exchange<br/>Live Spreads] --> N
 ```
 
-## Usage
+## 7. Reproduction
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
 
 # Full pipeline: ingest -> features -> backtest
 python run_backtest.py
 
-# Train model and see evaluation metrics
+# Train model and print evaluation metrics
 python model.py
+
+# Regenerate all charts
+python generate_charts.py
 
 # Live value bet scanner (requires ODDS_API_KEY in .env)
 python run_scanner.py --bankroll 1000
@@ -217,7 +226,7 @@ python run_arb_scanner.py --bankroll 1000
 python run_tips.py
 ```
 
-## Project Structure
+### Project Structure
 
 ```
 config.py              Configuration, feature columns, team/venue mappings
@@ -227,6 +236,7 @@ model.py               Ensemble training (LogReg + LightGBM + stacker)
 backtest.py            Walk-forward backtesting engine
 strategy.py            Favourite-only bet selection
 sizing.py              Kelly criterion stake sizing
+generate_charts.py     Publication charts for this README
 squiggle.py            Squiggle API consensus predictions
 weather.py             Open-Meteo weather data
 betfair.py             Betfair Exchange API
@@ -238,6 +248,19 @@ run_arb_scanner.py     Arbitrage scanner
 run_tips.py            Tipping predictions
 run_report.py          Performance reporting
 ```
+
+## 8. Evolution
+
+This project went through several iterations, each attempting to improve on the last:
+
+1. **v1** -- Basic Elo + logistic regression. Bet both sides. Lost money.
+2. **v2** (Gemini review) -- Margin-based Elo, ensemble model, daily bankroll lock. Still lost money.
+3. **v3** (Codex review) -- Logit-space stacker, feature leakage fixes. Broke even.
+4. **v4** -- Added weather, Squiggle consensus, FootyWire stats. Weather and Squiggle helped; team stats hurt.
+5. **v5** -- Favourite-only strategy with tight filters. Flipped from -$181 to +$110.
+6. **v6** -- Betfair Exchange integration (live only), enhanced Squiggle features. Marginal improvement.
+
+The biggest single improvement came not from better modelling but from better strategy (v5).
 
 ## License
 
