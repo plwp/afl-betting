@@ -1,10 +1,14 @@
-# AFL Value Betting Experiment
+# AFL Value Betting Experiment (Failed)
 
-An experiment in building a machine learning system to find value bets in Australian Rules Football (AFL) markets. The system combines Elo ratings, rolling form statistics, weather data, and consensus model predictions into an ensemble that blends its own signal with market odds via a calibrated stacker.
+A failed experiment in building a machine learning system to beat AFL betting markets. Published as a learning resource.
+
+The system combines Elo ratings, rolling form statistics, weather data, and consensus model predictions into an ensemble that blends its own signal with market odds via a calibrated stacker. After months of iteration it produces a backtest that looks marginally profitable -- but the evidence is too thin to trust.
 
 ## The Question
 
 Can a quantitative model identify profitable betting opportunities in AFL markets, where bookmaker odds already encode significant information?
+
+**Answer: Not convincingly.** The model ekes out a +0.0012 log loss edge over the market across 432 test matches, and the backtest shows +8.4% ROI -- but on only 43 bets over 10 years. That's noise, not signal.
 
 ## Approach
 
@@ -199,3 +203,7 @@ run_arb_scanner.py     Arbitrage scanner
 run_tips.py            Tipping predictions
 run_report.py          Performance reporting
 ```
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
