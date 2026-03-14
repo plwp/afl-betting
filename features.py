@@ -469,6 +469,38 @@ def _add_squiggle_consensus(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _add_enhanced_squiggle(df: pd.DataFrame) -> pd.DataFrame:
+    """Add enhanced Squiggle features: top-3 model prob and model spread."""
+    from squiggle import build_enhanced_squiggle_historical
+    years = range(int(df["year"].min()), int(df["year"].max()) + 1)
+    print("Building enhanced Squiggle features...")
+    enhanced = build_enhanced_squiggle_historical(years)
+
+    if enhanced.empty:
+        df["squiggle_top3_prob"] = df.get("squiggle_prob_home", 0.5)
+        df["squiggle_model_spread"] = 0.1
+        return df
+
+    # Deduplicate on (year, home_team, away_team) — average if multiple rounds match
+    enhanced_dedup = (
+        enhanced.groupby(["year", "home_team", "away_team"])
+        [["squiggle_top3_prob", "squiggle_model_spread"]]
+        .mean()
+        .reset_index()
+    )
+
+    df = df.merge(
+        enhanced_dedup,
+        on=["year", "home_team", "away_team"],
+        how="left",
+    )
+    df["squiggle_top3_prob"] = df["squiggle_top3_prob"].fillna(
+        df.get("squiggle_prob_home", 0.5)
+    )
+    df["squiggle_model_spread"] = df["squiggle_model_spread"].fillna(0.1)
+    return df
+
+
 def _add_team_stats_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add team-level match stats as rolling 5-game EWMA features.
 
@@ -596,11 +628,8 @@ def build_feature_matrix(
     if "bf_volume_ratio" not in df.columns:
         df["bf_volume_ratio"] = 0.5
 
-    # Enhanced Squiggle defaults for historical data
-    if "squiggle_top3_prob" not in df.columns:
-        df["squiggle_top3_prob"] = df["squiggle_prob_home"]
-    if "squiggle_model_spread" not in df.columns:
-        df["squiggle_model_spread"] = 0.1
+    # Enhanced Squiggle: backfill from historical tips data
+    df = _add_enhanced_squiggle(df)
 
     missing_features = [col for col in FEATURE_COLS if col not in df.columns]
     if missing_features:
