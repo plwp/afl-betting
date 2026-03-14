@@ -116,7 +116,9 @@ def walk_forward_backtest(
 
         if use_stacker:
             predictor, meta = fit_model_bundle(train_data, cal_data)
-            probs = predictor.predict_proba(test_data[FEATURE_COLS])[:, 1]
+            probs = predictor.predict_proba(
+                test_data[FEATURE_COLS],
+            )[:, 1]
         else:
             probs, lgb_meta = _fixed_weight_probs(train_data, cal_data, test_data)
 

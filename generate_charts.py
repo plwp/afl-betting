@@ -120,19 +120,21 @@ _, val, test = temporal_split(df)
 X_test = test[FEATURE_COLS]
 y_test = test["home_win"].to_numpy()
 market_test = test["market_prob_home"].to_numpy()
-lr_test, lgb_test, _ = predictor._base_probs(X_test)
+test_probs = predictor._base_probs(X_test)
 ens_test = predictor.predict_proba(X_test)[:, 1]
 
-models = ["Market", "LogReg", "LightGBM", "Ensemble"]
+models = ["Market", "LogReg", "LightGBM", "XGBoost", "MarginReg", "Ensemble"]
 ll_values = [
     log_loss(y_test, _clip_probs(market_test)),
-    log_loss(y_test, _clip_probs(lr_test)),
-    log_loss(y_test, _clip_probs(lgb_test)),
+    log_loss(y_test, _clip_probs(test_probs["lr"])),
+    log_loss(y_test, _clip_probs(test_probs["lgb"])),
+    log_loss(y_test, _clip_probs(test_probs["xgb"])),
+    log_loss(y_test, _clip_probs(test_probs["margin"])),
     log_loss(y_test, _clip_probs(ens_test)),
 ]
 
-fig, ax = plt.subplots(figsize=(8, 4.5))
-bar_colors = ["#6b7280", "#f59e0b", "#8b5cf6", "#2563eb"]
+fig, ax = plt.subplots(figsize=(8, 5.5))
+bar_colors = ["#6b7280", "#f59e0b", "#8b5cf6", "#10b981", "#ef4444", "#2563eb"]
 bars = ax.barh(models, ll_values, color=bar_colors, height=0.5, edgecolor="white")
 
 # Add value labels
@@ -142,7 +144,9 @@ for bar, val in zip(bars, ll_values):
 
 ax.set_xlabel("Test Log Loss (lower is better)")
 ax.set_title("Fig. 3: Model Comparison on Test Set (2023-2024)")
-ax.set_xlim(0.585, 0.607)
+ll_min = min(ll_values) - 0.005
+ll_max = max(ll_values) + 0.005
+ax.set_xlim(ll_min, ll_max)
 ax.axvline(x=ll_values[0], color="#6b7280", linestyle="--", alpha=0.4, linewidth=0.8)
 ax.invert_yaxis()
 fig.tight_layout()
@@ -180,10 +184,11 @@ importance = pd.Series(
 top15 = importance.tail(15)
 
 fig, ax = plt.subplots(figsize=(8, 5.5))
-colors_fi = ["#2563eb" if "market" in f or "elo" in f
+colors_fi = ["#2563eb" if "market" in f or "elo" in f or "glicko" in f
              else "#16a34a" if "ewma" in f or "form" in f or "win_pct" in f
-             else "#f59e0b" if "venue" in f or "travel" in f or "home_state" in f
+             else "#f59e0b" if "venue" in f or "travel" in f or "home_state" in f or "derby" in f or "away_in" in f
              else "#8b5cf6" if "squiggle" in f
+             else "#ef4444" if "rivalry" in f or "h2h" in f
              else "#6b7280"
              for f in top15.index]
 ax.barh(top15.index, top15.values, color=colors_fi, height=0.6)
@@ -197,10 +202,11 @@ ax.set_title("Fig. 5: LightGBM Feature Importance (Top 15)")
 # Legend
 from matplotlib.patches import Patch
 legend_elements = [
-    Patch(facecolor="#2563eb", label="Market/Elo"),
+    Patch(facecolor="#2563eb", label="Market/Elo/Glicko"),
     Patch(facecolor="#16a34a", label="Form/Performance"),
-    Patch(facecolor="#f59e0b", label="Venue/Travel"),
+    Patch(facecolor="#f59e0b", label="Venue/Travel/Context"),
     Patch(facecolor="#8b5cf6", label="External Models"),
+    Patch(facecolor="#ef4444", label="Matchup/Rivalry"),
     Patch(facecolor="#6b7280", label="Other"),
 ]
 ax.legend(handles=legend_elements, loc="lower right", fontsize=9)

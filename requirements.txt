@@ -2,6 +2,8 @@ pandas
 numpy
 scikit-learn
 lightgbm
+xgboost
+torch
 requests
 openpyxl
 python-dotenv

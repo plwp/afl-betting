@@ -80,6 +80,12 @@ ARB_STAKE_FRACTION = 0.05  # fraction of bankroll to deploy on an arb
 INITIAL_BANKROLL = 1000.0
 STACKER_C_VALUES = [0.01, 0.02, 0.05, 0.1]
 
+# --- Glicko-2 Parameters ---
+GLICKO2_INIT_RATING = 1500.0
+GLICKO2_INIT_RD = 350.0
+GLICKO2_INIT_VOL = 0.06
+GLICKO2_TAU = 0.5
+
 # --- Team-to-State Mappings ---
 TEAM_STATE = {
     "Adelaide": "SA", "Port Adelaide": "SA",
@@ -164,28 +170,28 @@ TRAVEL_HOURS = {
 
 # --- Feature Columns ---
 FEATURE_COLS = [
-    "elo_diff", "elo_prob",
+    "elo_diff",
     "market_prob_home", "market_prob_away", "market_overround",
     "market_elo_delta",
-    "is_home_state", "travel_hours_home", "travel_hours_away",
+    "travel_hours_away",
     "form_home_5", "form_away_5", "form_diff",
     "win_pct_home_10", "win_pct_away_10", "win_pct_diff",
     "venue_exp_home", "venue_exp_away", "venue_exp_diff",
     "rest_days_home", "rest_days_away", "rest_diff",
     "h2h_home_win_pct",
-    "season_round", "is_final",
+    "season_round",
     "margin_ewma_home", "margin_ewma_away", "margin_ewma_diff",
     "scoring_ewma_home", "scoring_ewma_away", "scoring_ewma_diff",
     # Weather
-    "rain_mm", "wind_speed", "is_wet", "is_roofed",
+    "rain_mm", "wind_speed",
     # Squiggle consensus
     "squiggle_prob_home",
-    # Betfair Exchange
-    "bf_spread_home", "bf_spread_away", "bf_volume_ratio",
     # Enhanced Squiggle
     "squiggle_top3_prob", "squiggle_model_spread",
-    # Team stats (rolling EWMA from FootyWire — available but not used by default)
-    # "disposals_diff", "clearances_diff", "inside50s_diff", "tackles_diff",
+    # Glicko-2
+    "glicko_prob", "glicko_uncertainty",
+    # Context / combinatorial
+    "rivalry_intensity", "home_venue_pct", "team_h2h_margin_ewma",
 ]
 
 # --- Betfair Exchange ---

@@ -14,6 +14,10 @@ from config import (
     ELO_SEASON_REVERT,
     FEATURE_COLS,
     FEATURE_PATH,
+    GLICKO2_INIT_RATING,
+    GLICKO2_INIT_RD,
+    GLICKO2_INIT_VOL,
+    GLICKO2_TAU,
     MERGED_PATH,
     ROOFED_VENUES,
     TEAM_STATE,
@@ -263,6 +267,10 @@ def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
         "market_elo_delta": 0.0,
         "travel_hours_home": 0.0, "travel_hours_away": 0.0,
         "is_home_state": 1,
+        "glicko_prob": 0.5, "glicko_uncertainty": 350.0,
+        "same_state_derby": 0, "away_in_home_state": 0,
+        "rivalry_intensity": 40.0, "home_venue_pct": 0.5,
+        "team_h2h_margin_ewma": 0.0,
     }
     for column, value in fill_values.items():
         if column in df.columns:
@@ -414,6 +422,15 @@ def build_current_match_features(
         "scoring_ewma_home": home["scoring_ewma"],
         "scoring_ewma_away": away["scoring_ewma"],
         "scoring_ewma_diff": home["scoring_ewma"] - away["scoring_ewma"],
+        # Glicko-2 defaults for live mode
+        "glicko_prob": elo_prob,
+        "glicko_uncertainty": 200.0,
+        # Context features
+        "same_state_derby": int(home_state == away_state) if home_state and away_state else 0,
+        "away_in_home_state": int(away_state == venue_state) if away_state and venue_state else 0,
+        "rivalry_intensity": 40.0,
+        "home_venue_pct": 0.5,
+        "team_h2h_margin_ewma": 0.0,
         # Defaults for features not available in live mode
         "rain_mm": 0.0,
         "wind_speed": 0.0,
@@ -425,7 +442,7 @@ def build_current_match_features(
         "bf_spread_away": 0.05,
         "bf_volume_ratio": 0.5,
         # Enhanced Squiggle defaults
-        "squiggle_top3_prob": market_prob_home,  # fall back to consensus/market
+        "squiggle_top3_prob": market_prob_home,
         "squiggle_model_spread": 0.1,
     }
     return features
@@ -600,6 +617,191 @@ def _add_team_stats_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def build_glicko2(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute Glicko-2 ratings with uncertainty for each team."""
+    import math
+
+    df = _prepare_matches(df).copy()
+
+    ratings = {}
+
+    def _get_state(team):
+        return ratings.get(team, (GLICKO2_INIT_RATING, GLICKO2_INIT_RD, GLICKO2_INIT_VOL))
+
+    def _glicko2_update(rating, rd, vol, opponent_rating, opponent_rd, score):
+        mu = (rating - 1500) / 173.7178
+        phi = rd / 173.7178
+        mu_j = (opponent_rating - 1500) / 173.7178
+        phi_j = opponent_rd / 173.7178
+
+        g_j = 1.0 / math.sqrt(1 + 3 * phi_j**2 / (math.pi**2))
+        E_val = 1.0 / (1 + math.exp(-g_j * (mu - mu_j)))
+
+        v = 1.0 / (g_j**2 * E_val * (1 - E_val) + 1e-10)
+        delta = v * g_j * (score - E_val)
+
+        a = math.log(vol**2)
+        tau = GLICKO2_TAU
+        f = lambda x: (
+            math.exp(x) * (delta**2 - phi**2 - v - math.exp(x))
+            / (2 * (phi**2 + v + math.exp(x))**2)
+            - (x - a) / tau**2
+        )
+
+        A = a
+        if delta**2 > phi**2 + v:
+            B = math.log(delta**2 - phi**2 - v)
+        else:
+            k = 1
+            while f(a - k * tau) < 0:
+                k += 1
+                if k > 100:
+                    break
+            B = a - k * tau
+
+        f_A = f(A)
+        f_B = f(B)
+        for _ in range(50):
+            if abs(B - A) < 1e-6:
+                break
+            C = A + (A - B) * f_A / (f_B - f_A)
+            f_C = f(C)
+            if f_C * f_B < 0:
+                A = B
+                f_A = f_B
+            else:
+                f_A /= 2
+            B = C
+            f_B = f_C
+
+        new_vol = math.exp(A / 2)
+        phi_star = math.sqrt(phi**2 + new_vol**2)
+        new_phi = 1.0 / math.sqrt(1.0 / phi_star**2 + 1.0 / v)
+        new_mu = mu + new_phi**2 * g_j * (score - E_val)
+
+        new_rating = 173.7178 * new_mu + 1500
+        new_rd = 173.7178 * new_phi
+        return new_rating, new_rd, new_vol
+
+    glicko_home_list = []
+    glicko_away_list = []
+    rd_home_list = []
+    rd_away_list = []
+    prev_season = None
+
+    for row in df.itertuples(index=False):
+        season = row.year
+        home = row.home_team
+        away = row.away_team
+
+        if prev_season is not None and season != prev_season:
+            for team in list(ratings.keys()):
+                r, rd, vol = ratings[team]
+                new_rd = min(math.sqrt(rd**2 + 50**2), GLICKO2_INIT_RD)
+                ratings[team] = (r, new_rd, vol)
+        prev_season = season
+
+        r_h, rd_h, vol_h = _get_state(home)
+        r_a, rd_a, vol_a = _get_state(away)
+
+        glicko_home_list.append(r_h)
+        glicko_away_list.append(r_a)
+        rd_home_list.append(rd_h)
+        rd_away_list.append(rd_a)
+
+        score_home = _match_result_from_margin(row.margin)
+
+        new_r_h, new_rd_h, new_vol_h = _glicko2_update(r_h, rd_h, vol_h, r_a, rd_a, score_home)
+        new_r_a, new_rd_a, new_vol_a = _glicko2_update(r_a, rd_a, vol_a, r_h, rd_h, 1.0 - score_home)
+
+        ratings[home] = (new_r_h, new_rd_h, new_vol_h)
+        ratings[away] = (new_r_a, new_rd_a, new_vol_a)
+
+    df["glicko_home"] = glicko_home_list
+    df["glicko_away"] = glicko_away_list
+    df["glicko_rd_home"] = rd_home_list
+    df["glicko_rd_away"] = rd_away_list
+
+    g_rd = 1.0 / np.sqrt(1 + 3 * (df["glicko_rd_home"]**2 + df["glicko_rd_away"]**2) / (np.pi**2 * 173.7178**2))
+    df["glicko_prob"] = 1.0 / (1 + np.exp(-g_rd * (df["glicko_home"] - df["glicko_away"]) / 173.7178))
+    df["glicko_uncertainty"] = np.sqrt(df["glicko_rd_home"]**2 + df["glicko_rd_away"]**2)
+
+    return df
+
+
+def _build_context_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add combinatorial / context features."""
+    # 1. same_state_derby
+    df["same_state_derby"] = df.apply(
+        lambda r: int(
+            TEAM_STATE.get(r["home_team"], "?") == TEAM_STATE.get(r["away_team"], "!")
+        ),
+        axis=1,
+    )
+
+    # 2. away_in_home_state
+    df["away_in_home_state"] = df.apply(
+        lambda r: int(
+            TEAM_STATE.get(r["away_team"], "?") == VENUE_STATE.get(r["venue"], "!")
+        ),
+        axis=1,
+    )
+
+    # 3. rivalry_intensity: rolling avg of abs(margin) between this pair
+    pair_margins = {}
+    rivalry_values = []
+    for row in df.itertuples(index=False):
+        pair = tuple(sorted((row.home_team, row.away_team)))
+        history = pair_margins.get(pair, [])
+        if len(history) == 0:
+            rivalry_values.append(40.0)
+        else:
+            rivalry_values.append(float(np.mean(history[-10:])))
+        pair_margins.setdefault(pair, []).append(abs(row.margin))
+    df["rivalry_intensity"] = rivalry_values
+
+    # 4. home_venue_pct
+    team_venue_counts = {}
+    team_match_counts = {}
+    venue_pct_values = []
+    for row in df.itertuples(index=False):
+        home = row.home_team
+        venue = row.venue
+        total = team_match_counts.get(home, 0)
+        at_venue = team_venue_counts.get((home, venue), 0)
+        if total == 0:
+            venue_pct_values.append(0.5)
+        else:
+            venue_pct_values.append(at_venue / total)
+        team_match_counts[home] = total + 1
+        team_venue_counts[(home, venue)] = at_venue + 1
+    df["home_venue_pct"] = venue_pct_values
+
+    # 5. team_h2h_margin_ewma
+    pair_margin_history = {}
+    h2h_ewma_values = []
+    alpha = 0.3
+    for row in df.itertuples(index=False):
+        pair = tuple(sorted((row.home_team, row.away_team)))
+        is_first = row.home_team == pair[0]
+        directional_margin = row.margin if is_first else -row.margin
+
+        ewma = pair_margin_history.get(pair)
+        if ewma is None:
+            h2h_ewma_values.append(0.0)
+        else:
+            h2h_ewma_values.append(ewma if is_first else -ewma)
+
+        if ewma is None:
+            pair_margin_history[pair] = directional_margin
+        else:
+            pair_margin_history[pair] = alpha * directional_margin + (1 - alpha) * ewma
+
+    df["team_h2h_margin_ewma"] = h2h_ewma_values
+
+    return df
+
+
 def build_feature_matrix(
     merged_path: str = MERGED_PATH,
     output_path: str = FEATURE_PATH,
@@ -614,6 +816,12 @@ def build_feature_matrix(
 
     print("Building rolling features...")
     df = build_rolling_features(df)
+
+    print("Building Glicko-2 ratings...")
+    df = build_glicko2(df)
+
+    print("Building context features...")
+    df = _build_context_features(df)
 
     # New data sources
     df = _add_weather_features(df)
