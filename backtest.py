@@ -12,9 +12,9 @@ from model import fit_model_bundle, _clip_probs, _tune_logreg, _tune_lgbm
 from sizing import edge, kelly_stake
 
 
-def _select_bet(row: pd.Series, prob_home: float, bankroll: float, edge_threshold: float):
-    """Choose at most one side per match to avoid contradictory double exposure."""
-    candidates = []
+def _select_bets(row: pd.Series, prob_home: float, bankroll: float, edge_threshold: float):
+    """Return all sides with positive edge above threshold (bet both sides if value exists)."""
+    bets = []
 
     odds_home = row.get("odds_home")
     if odds_home is not None and not pd.isna(odds_home):
@@ -22,10 +22,13 @@ def _select_bet(row: pd.Series, prob_home: float, bankroll: float, edge_threshol
         if home_edge > edge_threshold:
             stake = kelly_stake(prob_home, odds_home, bankroll)
             if stake > 0:
-                candidates.append({
+                odds_close = row.get("odds_home_close", odds_home)
+                if pd.isna(odds_close):
+                    odds_close = odds_home
+                bets.append({
                     "side": "home", "model_prob": prob_home, "odds": odds_home,
                     "edge": home_edge, "stake": stake, "won": row["home_win"] == 1,
-                    "odds_close": row.get("odds_home_close", odds_home),
+                    "odds_close": odds_close,
                 })
 
     odds_away = row.get("odds_away")
@@ -35,19 +38,16 @@ def _select_bet(row: pd.Series, prob_home: float, bankroll: float, edge_threshol
         if away_edge > edge_threshold:
             stake = kelly_stake(prob_away, odds_away, bankroll)
             if stake > 0:
-                candidates.append({
+                odds_close = row.get("odds_away_close", odds_away)
+                if pd.isna(odds_close):
+                    odds_close = odds_away
+                bets.append({
                     "side": "away", "model_prob": prob_away, "odds": odds_away,
                     "edge": away_edge, "stake": stake, "won": row["home_win"] == 0,
-                    "odds_close": row.get("odds_away_close", odds_away),
+                    "odds_close": odds_close,
                 })
 
-    if not candidates:
-        return None
-
-    chosen = max(candidates, key=lambda item: (item["edge"], item["model_prob"]))
-    if pd.isna(chosen["odds_close"]):
-        chosen["odds_close"] = chosen["odds"]
-    return chosen
+    return bets
 
 
 def _fixed_weight_probs(
@@ -127,34 +127,35 @@ def walk_forward_backtest(
                 pending_pnl = 0.0
             current_date = row["date"]
 
-            candidate = _select_bet(row, float(probs[idx]), daily_start_bankroll, edge_threshold)
-            if candidate is None:
+            candidates = _select_bets(row, float(probs[idx]), daily_start_bankroll, edge_threshold)
+            if not candidates:
                 continue
 
-            pnl = candidate["stake"] * (candidate["odds"] - 1) if candidate["won"] else -candidate["stake"]
-            pending_pnl += pnl
-            year_pnl += pnl
-            year_bets += 1
+            for candidate in candidates:
+                pnl = candidate["stake"] * (candidate["odds"] - 1) if candidate["won"] else -candidate["stake"]
+                pending_pnl += pnl
+                year_pnl += pnl
+                year_bets += 1
 
-            clv = (1 / candidate["odds_close"]) - (1 / candidate["odds"])
-            bet_log.append({
-                "date": row["date"],
-                "year": year,
-                "home_team": row["home_team"],
-                "away_team": row["away_team"],
-                "side": candidate["side"],
-                "model_prob": candidate["model_prob"],
-                "market_prob_home": row["market_prob_home"],
-                "odds": candidate["odds"],
-                "odds_close": candidate["odds_close"],
-                "edge": candidate["edge"],
-                "stake": candidate["stake"],
-                "won": candidate["won"],
-                "pnl": pnl,
-                "clv": clv,
-                "bankroll": bankroll + pending_pnl,
-            })
-            bankroll_history.append((row["date"], bankroll + pending_pnl))
+                clv = (1 / candidate["odds_close"]) - (1 / candidate["odds"])
+                bet_log.append({
+                    "date": row["date"],
+                    "year": year,
+                    "home_team": row["home_team"],
+                    "away_team": row["away_team"],
+                    "side": candidate["side"],
+                    "model_prob": candidate["model_prob"],
+                    "market_prob_home": row["market_prob_home"],
+                    "odds": candidate["odds"],
+                    "odds_close": candidate["odds_close"],
+                    "edge": candidate["edge"],
+                    "stake": candidate["stake"],
+                    "won": candidate["won"],
+                    "pnl": pnl,
+                    "clv": clv,
+                    "bankroll": bankroll + pending_pnl,
+                })
+                bankroll_history.append((row["date"], bankroll + pending_pnl))
 
         # End of year: apply remaining pending P&L
         bankroll += pending_pnl

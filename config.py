@@ -68,11 +68,11 @@ VAL_END = 2022
 TEST_START = 2023
 TEST_END = 2024
 
-# --- Betting Parameters (conservative from Gemini) ---
-KELLY_FRACTION = 0.15
-MAX_BET_FRACTION = 0.03
+# --- Betting Parameters ---
+KELLY_FRACTION = 0.25
+MAX_BET_FRACTION = 0.05
 MIN_STAKE = 5.0
-EDGE_THRESHOLD = 0.05
+EDGE_THRESHOLD = 0.03
 INITIAL_BANKROLL = 1000.0
 
 # --- Team-to-State Mappings ---

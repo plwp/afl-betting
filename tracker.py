@@ -108,6 +108,7 @@ class BetTracker:
     def get_performance_summary(self) -> dict:
         """Compute P&L summary across all settled bets."""
         with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
             settled = conn.execute(
                 "SELECT * FROM bets WHERE status = 'settled'"
             ).fetchall()
@@ -116,9 +117,9 @@ class BetTracker:
                 return {"total_bets": 0, "message": "No settled bets"}
 
             total = len(settled)
-            wins = sum(1 for r in settled if r[9] == "won")  # result column
-            total_staked = sum(r[6] for r in settled)  # stake column
-            total_pnl = sum(r[10] for r in settled if r[10])  # pnl column
+            wins = sum(1 for r in settled if r["result"] == "won")
+            total_staked = sum(r["stake"] for r in settled)
+            total_pnl = sum(r["pnl"] for r in settled if r["pnl"])
 
             return {
                 "total_bets": total,

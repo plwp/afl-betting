@@ -15,6 +15,7 @@ from config import (
     FEATURE_COLS,
     FEATURE_PATH,
     MERGED_PATH,
+    ROOFED_VENUES,
     TEAM_STATE,
     TRAVEL_HOURS,
     VENUE_STATE,
@@ -413,6 +414,12 @@ def build_current_match_features(
         "scoring_ewma_home": home["scoring_ewma"],
         "scoring_ewma_away": away["scoring_ewma"],
         "scoring_ewma_diff": home["scoring_ewma"] - away["scoring_ewma"],
+        # Defaults for features not available in live mode
+        "rain_mm": 0.0,
+        "wind_speed": 0.0,
+        "is_wet": 0,
+        "is_roofed": int(venue in ROOFED_VENUES) if venue else 0,
+        "squiggle_prob_home": 0.5,
     }
     return features
 
