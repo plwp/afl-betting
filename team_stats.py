@@ -20,8 +20,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 STAT_KEYS = [
     "Kicks", "Handballs", "Disposals", "Marks", "Tackles",
     "Hitouts", "Inside 50s", "Clearances", "Clangers", "Rebound 50s",
-    "Frees For", "Frees Against", "Contested Possessions",
-    "Uncontested Possessions", "Contested Marks",
+    "Frees For", "Frees Against", "Goals Kicked", "Scoring Shots",
 ]
 
 
@@ -47,38 +46,41 @@ def _scrape_match_stats(mid: int) -> dict | None:
         if resp.status_code != 200:
             return None
 
-        # Parse HTML tables
+        # Parse HTML tables — FootyWire puts H2H stats in a text blob
         tables = pd.read_html(StringIO(resp.text))
 
-        # Find the head-to-head stats table
-        # It typically has 3 columns: stat_name, team1_value, team2_value
-        stats_table = None
+        # Find the table containing "Head to Head" stats text blob
+        # Must contain stat names with numeric values, not just header text
+        h2h_text = None
         for tbl in tables:
-            if len(tbl.columns) == 3 and len(tbl) >= 10:
-                # Check if it has expected stat names
-                col0_vals = tbl.iloc[:, 0].astype(str).tolist()
-                if any("Disposals" in v for v in col0_vals):
-                    stats_table = tbl
+            for col_idx in range(min(len(tbl.columns), 3)):
+                text = str(tbl.iloc[0, col_idx]) if len(tbl) > 0 else ""
+                if (text.startswith("Head to Head") and "Disposals" in text
+                        and re.search(r"\d+ Disposals \d+", text)):
+                    h2h_text = text
                     break
+            if h2h_text:
+                break
 
-        if stats_table is None:
+        if h2h_text is None:
             return None
 
-        # Extract team names from column headers
-        cols = list(stats_table.columns)
-        home_team = _normalize(str(cols[1]))
-        away_team = _normalize(str(cols[2]))
+        # Extract team names: "Head to Head {home} Statistic {away}"
+        team_match = re.match(r"Head to Head\s+(.+?)\s+Statistic\s+(.+?)\s+\d", h2h_text)
+        if not team_match:
+            return None
+        home_team = _normalize(team_match.group(1))
+        away_team = _normalize(team_match.group(2))
 
-        # Build stats dict
+        # Parse stats using known stat names as anchors
         result = {"home_team": home_team, "away_team": away_team, "mid": mid}
-        for _, row in stats_table.iterrows():
-            stat_name = str(row.iloc[0]).strip()
-            if stat_name in STAT_KEYS:
-                try:
-                    result[f"home_{stat_name}"] = int(row.iloc[1])
-                    result[f"away_{stat_name}"] = int(row.iloc[2])
-                except (ValueError, TypeError):
-                    pass
+        for stat_name in STAT_KEYS:
+            # Pattern: {home_value} {stat_name} {away_value}
+            pattern = r"(\d+)\s+" + re.escape(stat_name) + r"\s+(\d+)"
+            m = re.search(pattern, h2h_text)
+            if m:
+                result[f"home_{stat_name}"] = int(m.group(1))
+                result[f"away_{stat_name}"] = int(m.group(2))
 
         # Cache
         with open(cache_file, "w") as f:

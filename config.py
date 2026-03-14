@@ -175,12 +175,8 @@ FEATURE_COLS = [
     "rain_mm", "wind_speed", "is_wet", "is_roofed",
     # Squiggle consensus
     "squiggle_prob_home",
-    # Team stats (enabled when team_stats.parquet exists)
-    # "disposals_home", "disposals_away", "disposals_diff",
-    # "contested_poss_home", "contested_poss_away", "contested_poss_diff",
-    # "clearances_home", "clearances_away", "clearances_diff",
-    # "inside50s_home", "inside50s_away", "inside50s_diff",
-    # "tackles_home", "tackles_away", "tackles_diff",
+    # Team stats (rolling EWMA from FootyWire — available but not used by default)
+    # "disposals_diff", "clearances_diff", "inside50s_diff", "tackles_diff",
 ]
 
 # --- Odds API ---

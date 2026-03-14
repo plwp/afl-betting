@@ -456,11 +456,16 @@ def _add_squiggle_consensus(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _add_team_stats_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add team-level match stats (disposals, contested possessions, etc.) as rolling features."""
+    """Add team-level match stats as rolling 5-game EWMA features.
+
+    Uses FootyWire scraped data, matched to our matches by (home_team, away_team, mid).
+    """
+    STAT_FEATURES = ["disposals", "clearances", "inside50s", "tackles", "marks"]
+
     stats_path = os.path.join(DATA_DIR, "team_stats.parquet")
     if not os.path.exists(stats_path):
         print("  No team stats file found — using defaults. Run: python team_stats.py")
-        for col in ["disposals", "contested_poss", "clearances", "inside50s", "tackles"]:
+        for col in STAT_FEATURES:
             for side in ["home", "away"]:
                 df[f"{col}_{side}"] = 0.0
             df[f"{col}_diff"] = 0.0
@@ -469,67 +474,82 @@ def _add_team_stats_features(df: pd.DataFrame) -> pd.DataFrame:
     print("Loading team stats...")
     stats_df = pd.read_parquet(stats_path)
 
-    # Build rolling 5-game team averages from match stats
-    # We need to map stats back to our matches by (home_team, away_team) ordering
+    # Map FootyWire column names to feature names
     stat_map = {
-        "Disposals": "disposals",
-        "Contested Possessions": "contested_poss",
-        "Clearances": "clearances",
-        "Inside 50s": "inside50s",
-        "Tackles": "tackles",
+        "home_Disposals": "disposals", "away_Disposals": "disposals",
+        "home_Clearances": "clearances", "away_Clearances": "clearances",
+        "home_Inside 50s": "inside50s", "away_Inside 50s": "inside50s",
+        "home_Tackles": "tackles", "away_Tackles": "tackles",
+        "home_Marks": "marks", "away_Marks": "marks",
     }
 
-    # Build team history from stats_df
-    home_hist = []
-    away_hist = []
+    # Build a team-centric history: one row per team per match
+    records = []
     for _, row in stats_df.iterrows():
-        ht = row.get("home_team", "")
-        at = row.get("away_team", "")
-        for orig, short in stat_map.items():
-            hcol = f"home_{orig}"
-            acol = f"away_{orig}"
-            if hcol in row and acol in row:
-                home_hist.append({"team": ht, "stat": short, "value": row[hcol]})
-                away_hist.append({"team": at, "stat": short, "value": row[acol]})
-                # Also record when playing away
-                home_hist.append({"team": at, "stat": short, "value": row[acol]})
-                away_hist.append({"team": ht, "stat": short, "value": row[hcol]})
-
-    if not home_hist:
-        for col in ["disposals", "contested_poss", "clearances", "inside50s", "tackles"]:
+        ht, at = row.get("home_team", ""), row.get("away_team", "")
+        mid = row.get("mid", 0)
+        for fw_col, feat in stat_map.items():
+            if fw_col in row.index and pd.notna(row[fw_col]):
+                side = "home" if fw_col.startswith("home_") else "away"
+                team = ht if side == "home" else at
+                records.append({"team": team, "mid": mid, "stat": feat, "value": float(row[fw_col])})
+    if not records:
+        for col in STAT_FEATURES:
             for side in ["home", "away"]:
                 df[f"{col}_{side}"] = 0.0
             df[f"{col}_diff"] = 0.0
         return df
 
-    # For simplicity, compute season-level team averages and map to matches
-    for orig, short in stat_map.items():
-        hcol = f"home_{orig}"
-        acol = f"away_{orig}"
-        if hcol not in stats_df.columns:
-            df[f"{short}_home"] = 0.0
-            df[f"{short}_away"] = 0.0
-            df[f"{short}_diff"] = 0.0
-            continue
+    hist = pd.DataFrame(records)
 
-        # Compute per-team season averages from stats_df
-        team_avgs = {}
-        for _, row in stats_df.iterrows():
-            ht = row.get("home_team", "")
-            at = row.get("away_team", "")
-            hval = row.get(hcol, 0)
-            aval = row.get(acol, 0)
-            if pd.notna(hval):
-                team_avgs.setdefault(ht, []).append(float(hval))
-            if pd.notna(aval):
-                team_avgs.setdefault(at, []).append(float(aval))
+    # Compute per-team rolling EWMA (span=5) for each stat, keyed by mid ordering
+    team_stat_ewma = {}
+    for stat in STAT_FEATURES:
+        stat_hist = hist[hist["stat"] == stat].sort_values("mid")
+        for team, grp in stat_hist.groupby("team"):
+            ewma = grp["value"].ewm(span=5, adjust=False).mean().shift(1)
+            for mid_val, ewma_val in zip(grp["mid"], ewma):
+                team_stat_ewma[(team, stat, mid_val)] = ewma_val
 
-        global_avg = np.mean([v for vals in team_avgs.values() for v in vals]) if team_avgs else 0.0
-        team_means = {t: np.mean(vals) for t, vals in team_avgs.items()}
+    # Match stats to our matches by (home_team, away_team) pair
+    # Find the closest mid in stats_df for each match
+    stats_by_pair = {}
+    for _, row in stats_df.iterrows():
+        key = (row["home_team"], row["away_team"])
+        stats_by_pair.setdefault(key, []).append(row["mid"])
 
-        df[f"{short}_home"] = df["home_team"].map(lambda t: team_means.get(t, global_avg))
-        df[f"{short}_away"] = df["away_team"].map(lambda t: team_means.get(t, global_avg))
-        df[f"{short}_diff"] = df[f"{short}_home"] - df[f"{short}_away"]
+    # Sort mids per pair
+    for key in stats_by_pair:
+        stats_by_pair[key].sort()
+
+    # For each match in df, find the corresponding FootyWire mid
+    match_mid_map = {}
+    pair_counters = {}
+    for idx, row in df.iterrows():
+        key = (row["home_team"], row["away_team"])
+        count = pair_counters.get(key, 0)
+        mids = stats_by_pair.get(key, [])
+        if count < len(mids):
+            match_mid_map[idx] = mids[count]
+        pair_counters[key] = count + 1
+
+    # Fill features
+    for stat in STAT_FEATURES:
+        home_vals, away_vals = [], []
+        for idx in df.index:
+            mid = match_mid_map.get(idx)
+            ht, at = df.at[idx, "home_team"], df.at[idx, "away_team"]
+            h = team_stat_ewma.get((ht, stat, mid), np.nan) if mid else np.nan
+            a = team_stat_ewma.get((at, stat, mid), np.nan) if mid else np.nan
+            home_vals.append(h)
+            away_vals.append(a)
+        df[f"{stat}_home"] = home_vals
+        df[f"{stat}_away"] = away_vals
+        # Fill NaN with global mean
+        for side in ["home", "away"]:
+            col = f"{stat}_{side}"
+            df[col] = df[col].fillna(df[col].mean() if df[col].notna().any() else 0.0)
+        df[f"{stat}_diff"] = df[f"{stat}_home"] - df[f"{stat}_away"]
 
     return df
 
