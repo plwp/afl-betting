@@ -45,6 +45,21 @@ Team-level FootyWire statistics (disposals, clearances, inside 50s, tackles) wer
 
 The stacker learns how much to trust the models vs the market. In practice it heavily weights market odds (~70%) and blends in model signals where they disagree.
 
+```mermaid
+graph LR
+    A[40 Features] --> B[Logistic Regression]
+    A --> C[LightGBM]
+    D[Market Odds] --> E[Calibrated Stacker]
+    B -->|logit prob| E
+    C -->|logit prob| E
+    B -->|LR - market delta| E
+    C -->|LGB - market delta| E
+    D -->|logit prob| E
+    E --> F{Edge > 5%?}
+    F -->|Yes| G[Kelly Stake]
+    F -->|No| H[No Bet]
+```
+
 ### Betting Strategy
 
 **Favourite-only** with strict filters:
@@ -159,6 +174,26 @@ The project went through several iterations (see git log):
 5. **Favourite-only strategy** -- Replaced losing underdog-heavy strategy; flipped P&L from -$181 to +$110
 6. **Betfair Exchange** -- Added live exchange data (useful for scanning, not backtest)
 7. **Enhanced Squiggle** -- Top-3 model averaging and model disagreement features
+
+## Data Pipeline
+
+```mermaid
+graph TD
+    A[AFL Match CSVs<br/>2009-2024] --> D[data_ingest.py]
+    B[AusportsBetting<br/>Historical Odds] --> D
+    D --> E[afl_merged.parquet]
+    E --> F[features.py]
+    G[Open-Meteo API<br/>Weather] --> F
+    H[Squiggle API<br/>Model Consensus] --> F
+    I[FootyWire<br/>Team Stats] --> F
+    F --> J[feature_matrix.parquet<br/>40 features per match]
+    J --> K[model.py<br/>Train Ensemble]
+    J --> L[backtest.py<br/>Walk-Forward Test]
+    K --> M[model_bundle.pkl]
+    M --> N[run_scanner.py<br/>Live Betting]
+    O[The Odds API<br/>Live Odds] --> N
+    P[Betfair Exchange<br/>Live Spreads] --> N
+```
 
 ## Usage
 
