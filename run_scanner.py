@@ -7,13 +7,18 @@ import joblib
 import pandas as pd
 from tabulate import tabulate
 
+from datetime import datetime
+
 from config import (
     FEATURE_PATH, MODEL_DIR, FEATURE_COLS,
     INITIAL_BANKROLL, EDGE_THRESHOLD,
 )
 from features import build_current_match_features
 from scanner import fetch_odds, parse_odds, scan_value_bets
+from model import EnsemblePredictor  # noqa: F401 — needed for pickle
 from tracker import BetTracker
+from betfair import get_betfair_data
+from squiggle import get_enhanced_squiggle_data
 
 
 def main():
@@ -59,6 +64,17 @@ def main():
     odds_df = parse_odds(events)
     print(f"\n{len(odds_df)} upcoming matches found")
 
+    # Enrich with Betfair Exchange data
+    betfair_data = get_betfair_data()
+
+    # Enrich with enhanced Squiggle data (current year + estimate round)
+    now = datetime.now()
+    current_year = now.year
+    # Estimate current round from week of year (AFL starts ~mid-March)
+    week = now.isocalendar()[1]
+    estimated_round = max(1, week - 10)
+    squiggle_data = get_enhanced_squiggle_data(current_year, estimated_round)
+
     # Build model predictions for each matchup
     model_probs = {}
     for _, row in odds_df.iterrows():
@@ -71,6 +87,21 @@ def main():
         )
         if feats is None:
             continue
+
+        # Override with live Betfair data if available
+        key = (row["home_team"], row["away_team"])
+        if key in betfair_data:
+            bf = betfair_data[key]
+            feats["bf_spread_home"] = bf["bf_spread_home"]
+            feats["bf_spread_away"] = bf["bf_spread_away"]
+            feats["bf_volume_ratio"] = bf["bf_volume_ratio"]
+
+        # Override with live enhanced Squiggle data if available
+        if key in squiggle_data:
+            sq = squiggle_data[key]
+            feats["squiggle_top3_prob"] = sq["squiggle_top3_prob"]
+            feats["squiggle_model_spread"] = sq["squiggle_model_spread"]
+
         X = pd.DataFrame([feats])[FEATURE_COLS]
         prob = predictor.predict_proba(X)[0, 1]
         model_probs[(row["home_team"], row["away_team"])] = float(prob)

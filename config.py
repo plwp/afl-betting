@@ -175,9 +175,18 @@ FEATURE_COLS = [
     "rain_mm", "wind_speed", "is_wet", "is_roofed",
     # Squiggle consensus
     "squiggle_prob_home",
+    # Betfair Exchange
+    "bf_spread_home", "bf_spread_away", "bf_volume_ratio",
+    # Enhanced Squiggle
+    "squiggle_top3_prob", "squiggle_model_spread",
     # Team stats (rolling EWMA from FootyWire — available but not used by default)
     # "disposals_diff", "clearances_diff", "inside50s_diff", "tackles_diff",
 ]
+
+# --- Betfair Exchange ---
+BETFAIR_USERNAME = os.getenv("BETFAIR_USERNAME", "")
+BETFAIR_PASSWORD = os.getenv("BETFAIR_PASSWORD", "")
+BETFAIR_APP_KEY = os.getenv("BETFAIR_APP_KEY", "")
 
 # --- Odds API ---
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")

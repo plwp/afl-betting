@@ -420,6 +420,13 @@ def build_current_match_features(
         "is_wet": 0,
         "is_roofed": int(venue in ROOFED_VENUES) if venue else 0,
         "squiggle_prob_home": 0.5,
+        # Betfair Exchange defaults (neutral values for backtest)
+        "bf_spread_home": 0.05,
+        "bf_spread_away": 0.05,
+        "bf_volume_ratio": 0.5,
+        # Enhanced Squiggle defaults
+        "squiggle_top3_prob": market_prob_home,  # fall back to consensus/market
+        "squiggle_model_spread": 0.1,
     }
     return features
 
@@ -580,6 +587,20 @@ def build_feature_matrix(
     df = _add_weather_features(df)
     df = _add_squiggle_consensus(df)
     df = _add_team_stats_features(df)
+
+    # Betfair Exchange defaults for historical data (not available in backtest)
+    if "bf_spread_home" not in df.columns:
+        df["bf_spread_home"] = 0.05
+    if "bf_spread_away" not in df.columns:
+        df["bf_spread_away"] = 0.05
+    if "bf_volume_ratio" not in df.columns:
+        df["bf_volume_ratio"] = 0.5
+
+    # Enhanced Squiggle defaults for historical data
+    if "squiggle_top3_prob" not in df.columns:
+        df["squiggle_top3_prob"] = df["squiggle_prob_home"]
+    if "squiggle_model_spread" not in df.columns:
+        df["squiggle_model_spread"] = 0.1
 
     missing_features = [col for col in FEATURE_COLS if col not in df.columns]
     if missing_features:
