@@ -16,6 +16,8 @@ Sports betting markets are widely considered semi-efficient: bookmaker odds inco
 
 **Coverage**: 16 seasons (2009-2024), ~3,100 matches with opening and closing odds.
 
+**Odds source**: Historical odds from AusportsBetting.com. These are "best available" market odds rather than odds from a single bookmaker, which means the backtested prices may not have been available from any single account in practice. This flatters ROI -- a real bettor would face worse prices on average.
+
 | Source | Data | Usage |
 |--------|------|-------|
 | AFL-Data-Analysis (GitHub) | Match results, scores, venues | Core match data |
@@ -80,6 +82,8 @@ graph LR
 
 This replaced an earlier strategy that bet both sides and underdogs, which lost -$181. The switch to favourite-only flipped the backtest to +$110.
 
+**Important caveat**: the favourite-only filters were chosen *after* observing that earlier strategies lost money. While the model weights are out-of-sample (walk-forward retraining), the strategy itself was effectively fit to the 2015-2024 backtest period. This is a form of selection bias that likely inflates the reported ROI.
+
 ### 3.4 Walk-Forward Protocol
 
 For each test year Y (2015-2024):
@@ -131,7 +135,7 @@ Market-derived features dominate (top 3 are all market odds). The model's margin
 | Bankroll Return | +11.0% ($1,000 -> $1,110) |
 | Max Drawdown | -10.9% |
 | Sharpe-like Ratio | 0.71 |
-| Avg Closing Line Value | -0.0080 |
+| Avg CLV (implied prob delta) | -0.0080 |
 
 ![Bankroll Curve](charts/bankroll_curve.png)
 
@@ -166,13 +170,17 @@ The cumulative P&L curve shows high path-dependency. The system spent bets 10-25
 
 1. **Insufficient sample size.** 43 bets over 10 years cannot establish statistical significance. A binomial test on the 67.4% win rate at the observed average odds gives p ~ 0.15 -- nowhere near the 0.05 threshold. You would need ~200+ bets at this win rate to reach significance.
 
-2. **Negative closing line value.** The average CLV of -0.008 means the model is betting into lines that move against it. In efficient markets, positive CLV is the hallmark of a genuine edge. Negative CLV suggests the market is smarter than the model.
+2. **Negative closing line value.** The average CLV of -0.008 (measured as implied probability delta: `1/odds_close - 1/odds_open`) means the model is betting into lines that move against it. In efficient markets, positive CLV is the hallmark of a genuine edge. Negative CLV suggests the market is smarter than the model and the opening price was already too generous.
 
 3. **Individual models lose to the market.** Both logistic regression and LightGBM have worse log loss than simply using bookmaker odds. The stacker recovers a tiny edge (+0.0012 log loss) by learning to mostly trust the market and nudge predictions slightly -- but this is a razor-thin margin.
 
 4. **Small-sample flattery.** The 2021-2022 period (3 bets, 100% win rate, +$46) accounts for ~40% of total profit. Remove those 3 bets and ROI drops to ~5%.
 
 5. **No live validation.** All results are backtested against historical odds. Real-world execution faces additional headwinds: odds may not be available at the backtested price, accounts may be limited, and the model has never been tested in production.
+
+6. **Strategy overfitting.** The favourite-only filters were discovered by iterating on the backtest. While model weights are genuinely out-of-sample, the decision to restrict to favourites with >55% model probability and odds <= 3.0 was made after seeing that broader strategies lost money. This is a form of data mining that inflates the apparent edge.
+
+7. **Favourite-longshot bias.** AFL markets typically have lower overround on favourites than on underdogs. By exclusively betting favourites, the strategy may simply be paying less "tax" to the bookmaker rather than exploiting a genuine informational edge. The +8.4% ROI should be compared against a naive "bet all favourites" baseline, not zero.
 
 ### What we learned
 
