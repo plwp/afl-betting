@@ -20,6 +20,7 @@ from config import (
     FEATURE_COLS,
     FEATURE_PATH,
     MODEL_DIR,
+    STACKER_C_VALUES,
     TEST_END,
     TEST_START,
     TRAIN_END,
@@ -218,7 +219,7 @@ def _fit_stacker(
 
     best_score = float("inf")
     best_model = None
-    for c_value in [0.05, 0.1, 0.25, 0.5, 1.0]:
+    for c_value in STACKER_C_VALUES:
         model = LogisticRegression(max_iter=5000, C=c_value, solver="lbfgs")
         model.fit(stack_X, y_val)
         score = log_loss(y_val, _clip_probs(model.predict_proba(stack_X)[:, 1]))

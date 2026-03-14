@@ -11,7 +11,8 @@ from datetime import datetime
 
 from config import (
     FEATURE_PATH, MODEL_DIR, FEATURE_COLS,
-    INITIAL_BANKROLL, EDGE_THRESHOLD,
+    INITIAL_BANKROLL, EDGE_THRESHOLD, MAX_ODDS, MIN_MODEL_PROB,
+    FAVOURITE_ONLY,
 )
 from features import build_current_match_features
 from scanner import fetch_odds, parse_odds, scan_value_bets
@@ -31,6 +32,14 @@ def main():
                         help="Log bets to tracker database")
     parser.add_argument("--refresh", action="store_true",
                         help="Force refresh odds (ignore cache)")
+    parser.add_argument("--max-odds", type=float, default=MAX_ODDS,
+                        help="Maximum odds to bet (default: 3.0)")
+    parser.add_argument("--min-prob", type=float, default=MIN_MODEL_PROB,
+                        help="Minimum model probability (default: 0.55)")
+    parser.add_argument("--fav-only", action="store_true", default=FAVOURITE_ONLY,
+                        help="Favourite-only strategy (default: True)")
+    parser.add_argument("--no-fav-only", dest="fav_only", action="store_false",
+                        help="Disable favourite-only strategy")
     args = parser.parse_args()
 
     # Load model
@@ -107,7 +116,11 @@ def main():
         model_probs[(row["home_team"], row["away_team"])] = float(prob)
 
     # Scan for value
-    value_bets = scan_value_bets(odds_df, model_probs, args.bankroll, args.edge)
+    value_bets = scan_value_bets(
+        odds_df, model_probs, args.bankroll, args.edge,
+        max_odds=args.max_odds, min_model_prob=args.min_prob,
+        favourite_only=args.fav_only,
+    )
 
     if value_bets.empty:
         print("\nNo value bets found above edge threshold.")
@@ -121,20 +134,42 @@ def main():
                       f"odds={row['best_home_odds']:.2f}/{row['best_away_odds']:.2f}")
         return
 
-    # Display value bets
-    display = value_bets[[
-        "match", "side", "model_prob", "implied_prob",
-        "best_odds", "bookmaker", "edge", "kelly_stake",
-    ]].copy()
-    display["model_prob"] = display["model_prob"].map("{:.1%}".format)
-    display["implied_prob"] = display["implied_prob"].map("{:.1%}".format)
-    display["edge"] = display["edge"].map("{:+.1%}".format)
-    display["kelly_stake"] = display["kelly_stake"].map("${:.2f}".format)
+    # Split arbs from EV bets for display
+    arb_bets = value_bets[value_bets.get("is_arb", False) == True] if "is_arb" in value_bets.columns else pd.DataFrame()
+    ev_bets = value_bets[value_bets.get("is_arb", False) != True] if "is_arb" in value_bets.columns else value_bets
 
-    print(f"\n{'='*70}")
-    print(f"VALUE BETS FOUND: {len(value_bets)}")
-    print(f"{'='*70}")
-    print(tabulate(display, headers="keys", tablefmt="simple", showindex=False))
+    if not arb_bets.empty:
+        arb_display = arb_bets[[
+            "match", "side", "best_odds", "bookmaker", "edge", "kelly_stake",
+        ]].copy()
+        arb_display["edge"] = arb_display["edge"].map("{:+.2%}".format)
+        arb_display["kelly_stake"] = arb_display["kelly_stake"].map("${:.2f}".format)
+        arb_display.rename(columns={"edge": "arb_margin"}, inplace=True)
+        n_arb_matches = arb_bets["match"].nunique()
+        profit = arb_bets.drop_duplicates("match")["arb_profit"].sum() if "arb_profit" in arb_bets.columns else 0
+        print(f"\n{'='*70}")
+        print(f"ARBITRAGE FOUND: {n_arb_matches} match(es), ${profit:.2f} guaranteed profit")
+        print(f"{'='*70}")
+        print(tabulate(arb_display, headers="keys", tablefmt="simple", showindex=False))
+
+    if not ev_bets.empty:
+        display = ev_bets[[
+            "match", "side", "model_prob", "implied_prob",
+            "best_odds", "bookmaker", "edge", "kelly_stake",
+        ]].copy()
+        display["model_prob"] = display["model_prob"].map("{:.1%}".format)
+        display["implied_prob"] = display["implied_prob"].map("{:.1%}".format)
+        display["edge"] = display["edge"].map("{:+.1%}".format)
+        display["kelly_stake"] = display["kelly_stake"].map("${:.2f}".format)
+        print(f"\n{'='*70}")
+        print(f"VALUE BETS FOUND: {len(ev_bets)}")
+        print(f"{'='*70}")
+        print(tabulate(display, headers="keys", tablefmt="simple", showindex=False))
+
+    if arb_bets.empty and ev_bets.empty:
+        print(f"\n{'='*70}")
+        print("No bets found.")
+        print(f"{'='*70}")
 
     # Log to tracker if requested
     if args.log:

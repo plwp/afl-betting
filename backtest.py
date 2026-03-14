@@ -7,9 +7,13 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from config import EDGE_THRESHOLD, FEATURE_COLS, INITIAL_BANKROLL, MIN_STAKE
+from config import (
+    EDGE_THRESHOLD, FEATURE_COLS, INITIAL_BANKROLL, MAX_ODDS, MIN_MODEL_PROB,
+    MIN_STAKE,
+)
 from model import fit_model_bundle, _clip_probs, _tune_logreg, _tune_lgbm
 from sizing import edge, kelly_stake
+from strategy import FavouriteOnlyStrategy
 
 
 def _select_bets(row: pd.Series, prob_home: float, bankroll: float, edge_threshold: float):
@@ -82,12 +86,24 @@ def walk_forward_backtest(
     end_year: int = 2024,
     initial_bankroll: float = INITIAL_BANKROLL,
     edge_threshold: float = EDGE_THRESHOLD,
-    use_stacker: bool = False,
+    use_stacker: bool = True,
+    max_odds: float = MAX_ODDS,
+    min_model_prob: float = MIN_MODEL_PROB,
+    favourite_only: bool = True,
 ) -> dict:
     """Walk-forward backtest with yearly retraining, single bet per match, daily bankroll lock."""
     bankroll = float(initial_bankroll)
     bet_log = []
     bankroll_history = [(df[df["year"] == start_year]["date"].min(), bankroll)]
+
+    if favourite_only:
+        strategy = FavouriteOnlyStrategy(
+            edge_threshold=edge_threshold,
+            max_odds=max_odds,
+            min_model_prob=min_model_prob,
+        )
+    else:
+        strategy = None
 
     for year in range(start_year, end_year + 1):
         train_data = df[df["year"] <= year - 3].copy()
@@ -127,7 +143,10 @@ def walk_forward_backtest(
                 pending_pnl = 0.0
             current_date = row["date"]
 
-            candidates = _select_bets(row, float(probs[idx]), daily_start_bankroll, edge_threshold)
+            if strategy is not None:
+                candidates = strategy.select_bets(row, float(probs[idx]), daily_start_bankroll)
+            else:
+                candidates = _select_bets(row, float(probs[idx]), daily_start_bankroll, edge_threshold)
             if not candidates:
                 continue
 

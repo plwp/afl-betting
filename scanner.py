@@ -11,7 +11,8 @@ from datetime import datetime
 from config import (
     ODDS_API_KEY, ODDS_API_BASE, ODDS_CACHE_DIR,
     ODDS_CACHE_TTL, AU_BOOKMAKERS, EDGE_THRESHOLD,
-    TEAM_NAME_MAP,
+    FAVOURITE_ONLY, MAX_ODDS, MIN_MODEL_PROB, TEAM_NAME_MAP,
+    ARB_STAKE_FRACTION, MIN_STAKE,
 )
 from sizing import kelly_stake, edge
 
@@ -119,60 +120,144 @@ def parse_odds(events: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _arb_stakes(odds_home: float, odds_away: float, bankroll: float,
+                 stake_fraction: float = ARB_STAKE_FRACTION) -> tuple:
+    """Compute stakes for a cross-bookie arbitrage.
+
+    Returns (stake_home, stake_away, guaranteed_profit) or None if no arb.
+    """
+    if odds_home <= 1 or odds_away <= 1:
+        return None
+    inv_sum = 1 / odds_home + 1 / odds_away
+    if inv_sum >= 1:
+        return None  # no arb
+    total = bankroll * stake_fraction
+    stake_home = round(total * (1 / odds_home) / inv_sum, 2)
+    stake_away = round(total * (1 / odds_away) / inv_sum, 2)
+    profit = round(total / inv_sum - total, 2)
+    if stake_home < MIN_STAKE or stake_away < MIN_STAKE:
+        return None
+    return stake_home, stake_away, profit
+
+
 def scan_value_bets(odds_df: pd.DataFrame,
                     model_probs: dict,
                     bankroll: float,
-                    edge_threshold: float = EDGE_THRESHOLD) -> pd.DataFrame:
-    """Find +EV bets — at most one side per match (best edge wins)."""
+                    edge_threshold: float = EDGE_THRESHOLD,
+                    max_odds: float = MAX_ODDS,
+                    min_model_prob: float = MIN_MODEL_PROB,
+                    favourite_only: bool = FAVOURITE_ONLY) -> pd.DataFrame:
+    """Find +EV bets and cross-bookie arbitrages.
+
+    Arbs bypass all filters (favourite-only, odds cap, model prob).
+    For non-arb EV bets, when favourite_only=True only bets the side where
+    model prob >= min_model_prob, market agrees (implied prob > 0.5),
+    and odds <= max_odds.
+    """
     value_bets = []
 
     for _, row in odds_df.iterrows():
         key = (row["home_team"], row["away_team"])
+        match_label = f"{row['home_team']} v {row['away_team']}"
+        odds_h = row["best_home_odds"]
+        odds_a = row["best_away_odds"]
+
+        # --- Arb check first (bypasses all filters) ---
+        if odds_h > 0 and odds_a > 0:
+            arb = _arb_stakes(odds_h, odds_a, bankroll)
+            if arb is not None:
+                stake_home, stake_away, profit = arb
+                arb_margin = 1 - (1 / odds_h + 1 / odds_a)
+                value_bets.append({
+                    "match": match_label,
+                    "side": row["home_team"],
+                    "model_prob": model_probs.get(key, 0),
+                    "implied_prob": 1 / odds_h,
+                    "best_odds": odds_h,
+                    "bookmaker": row["best_home_bookie"],
+                    "edge": arb_margin,
+                    "kelly_stake": stake_home,
+                    "commence": row["commence_time"],
+                    "is_arb": True,
+                    "arb_profit": profit,
+                })
+                value_bets.append({
+                    "match": match_label,
+                    "side": row["away_team"],
+                    "model_prob": model_probs.get(key, 0),
+                    "implied_prob": 1 / odds_a,
+                    "best_odds": odds_a,
+                    "bookmaker": row["best_away_bookie"],
+                    "edge": arb_margin,
+                    "kelly_stake": stake_away,
+                    "commence": row["commence_time"],
+                    "is_arb": True,
+                    "arb_profit": profit,
+                })
+                continue  # arb found — skip EV logic for this match
+
+        # --- Normal EV logic ---
         if key not in model_probs:
             continue
 
         prob_home = model_probs[key]
         prob_away = 1 - prob_home
+        implied_home = 1 / odds_h if odds_h > 0 else 0
+        implied_away = 1 / odds_a if odds_a > 0 else 0
         candidates = []
 
-        if row["best_home_odds"] > 0:
-            e = edge(prob_home, row["best_home_odds"])
-            if e > edge_threshold:
-                stake = kelly_stake(prob_home, row["best_home_odds"], bankroll)
-                if stake > 0:
-                    candidates.append({
-                        "match": f"{row['home_team']} v {row['away_team']}",
-                        "side": row["home_team"],
-                        "model_prob": prob_home,
-                        "implied_prob": 1 / row["best_home_odds"],
-                        "best_odds": row["best_home_odds"],
-                        "bookmaker": row["best_home_bookie"],
-                        "edge": e,
-                        "kelly_stake": stake,
-                        "commence": row["commence_time"],
-                    })
+        if odds_h > 0:
+            skip = (favourite_only
+                    and (prob_home < min_model_prob
+                         or implied_home <= 0.5
+                         or odds_h > max_odds))
+            if not skip:
+                e = edge(prob_home, odds_h)
+                if e > edge_threshold:
+                    stake = kelly_stake(prob_home, odds_h, bankroll)
+                    if stake > 0:
+                        candidates.append({
+                            "match": match_label,
+                            "side": row["home_team"],
+                            "model_prob": prob_home,
+                            "implied_prob": implied_home,
+                            "best_odds": odds_h,
+                            "bookmaker": row["best_home_bookie"],
+                            "edge": e,
+                            "kelly_stake": stake,
+                            "commence": row["commence_time"],
+                            "is_arb": False,
+                        })
 
-        if row["best_away_odds"] > 0:
-            e = edge(prob_away, row["best_away_odds"])
-            if e > edge_threshold:
-                stake = kelly_stake(prob_away, row["best_away_odds"], bankroll)
-                if stake > 0:
-                    candidates.append({
-                        "match": f"{row['home_team']} v {row['away_team']}",
-                        "side": row["away_team"],
-                        "model_prob": prob_away,
-                        "implied_prob": 1 / row["best_away_odds"],
-                        "best_odds": row["best_away_odds"],
-                        "bookmaker": row["best_away_bookie"],
-                        "edge": e,
-                        "kelly_stake": stake,
-                        "commence": row["commence_time"],
-                    })
+        if odds_a > 0:
+            skip = (favourite_only
+                    and (prob_away < min_model_prob
+                         or implied_away <= 0.5
+                         or odds_a > max_odds))
+            if not skip:
+                e = edge(prob_away, odds_a)
+                if e > edge_threshold:
+                    stake = kelly_stake(prob_away, odds_a, bankroll)
+                    if stake > 0:
+                        candidates.append({
+                            "match": match_label,
+                            "side": row["away_team"],
+                            "model_prob": prob_away,
+                            "implied_prob": implied_away,
+                            "best_odds": odds_a,
+                            "bookmaker": row["best_away_bookie"],
+                            "edge": e,
+                            "kelly_stake": stake,
+                            "commence": row["commence_time"],
+                            "is_arb": False,
+                        })
 
         if candidates:
             value_bets.append(max(candidates, key=lambda b: (b["edge"], b["model_prob"])))
 
     result = pd.DataFrame(value_bets)
     if not result.empty:
-        result = result.sort_values("edge", ascending=False).reset_index(drop=True)
+        result = result.sort_values(
+            ["is_arb", "edge"], ascending=[False, False],
+        ).reset_index(drop=True)
     return result
