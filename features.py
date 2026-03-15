@@ -460,7 +460,51 @@ def _add_weather_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def _add_squiggle_consensus(df: pd.DataFrame) -> pd.DataFrame:
     """Add Squiggle model consensus predictions."""
-    from squiggle import build_squiggle_consensus
+    from squiggle import build_squiggle_consensus, _normalize_round_id
+
+    def _merge_with_round_fallback(
+        base_df: pd.DataFrame,
+        signal_df: pd.DataFrame,
+        feature_cols: list[str],
+    ) -> pd.DataFrame:
+        base = base_df.copy()
+        base["_row_id"] = np.arange(len(base))
+        base["_round_key"] = base["round_num"].map(_normalize_round_id)
+
+        signal = signal_df.copy()
+        signal["_round_key"] = signal["round_num"].map(_normalize_round_id)
+        exact_keys = ["year", "home_team", "away_team", "_round_key"]
+        pair_keys = ["year", "home_team", "away_team"]
+
+        exact = base.merge(
+            signal[exact_keys + feature_cols].drop_duplicates(exact_keys),
+            on=exact_keys,
+            how="left",
+        )
+
+        missing = exact[feature_cols[0]].isna()
+        if missing.any():
+            pair_counts = signal.groupby(pair_keys).size().rename("_pair_count").reset_index()
+            unique_pairs = (
+                signal.merge(pair_counts, on=pair_keys, how="left")
+                .loc[lambda x: x["_pair_count"] == 1, pair_keys + feature_cols]
+                .drop_duplicates(pair_keys)
+            )
+            fallback = exact.loc[missing, ["_row_id"] + pair_keys].merge(
+                unique_pairs,
+                on=pair_keys,
+                how="left",
+            )
+            fallback = fallback.set_index("_row_id")
+            for col in feature_cols:
+                exact.loc[missing, col] = exact.loc[missing, "_row_id"].map(fallback[col])
+
+        return (
+            exact.sort_values("_row_id", kind="mergesort")
+            .drop(columns=["_row_id", "_round_key"])
+            .reset_index(drop=True)
+        )
+
     years = range(int(df["year"].min()), int(df["year"].max()) + 1)
     print("Fetching Squiggle predictions...")
     consensus = build_squiggle_consensus(years)
@@ -469,26 +513,58 @@ def _add_squiggle_consensus(df: pd.DataFrame) -> pd.DataFrame:
         df["squiggle_prob_home"] = 0.5
         return df
 
-    # Match on (year, home_team, away_team) — round numbers differ between sources.
-    # For the rare case of duplicate home/away pairs in a season, average them.
-    consensus_dedup = (
-        consensus.groupby(["year", "home_team", "away_team"])["squiggle_prob_home"]
-        .mean()
-        .reset_index()
-    )
-
-    df = df.merge(
-        consensus_dedup,
-        on=["year", "home_team", "away_team"],
-        how="left",
-    )
+    df = _merge_with_round_fallback(df, consensus, ["squiggle_prob_home"])
     df["squiggle_prob_home"] = df["squiggle_prob_home"].fillna(0.5)
     return df
 
 
 def _add_enhanced_squiggle(df: pd.DataFrame) -> pd.DataFrame:
     """Add enhanced Squiggle features: top-3 model prob and model spread."""
-    from squiggle import build_enhanced_squiggle_historical
+    from squiggle import build_enhanced_squiggle_historical, _normalize_round_id
+
+    def _merge_with_round_fallback(
+        base_df: pd.DataFrame,
+        signal_df: pd.DataFrame,
+        feature_cols: list[str],
+    ) -> pd.DataFrame:
+        base = base_df.copy()
+        base["_row_id"] = np.arange(len(base))
+        base["_round_key"] = base["round_num"].map(_normalize_round_id)
+
+        signal = signal_df.copy()
+        signal["_round_key"] = signal["round_num"].map(_normalize_round_id)
+        exact_keys = ["year", "home_team", "away_team", "_round_key"]
+        pair_keys = ["year", "home_team", "away_team"]
+
+        exact = base.merge(
+            signal[exact_keys + feature_cols].drop_duplicates(exact_keys),
+            on=exact_keys,
+            how="left",
+        )
+
+        missing = exact[feature_cols[0]].isna()
+        if missing.any():
+            pair_counts = signal.groupby(pair_keys).size().rename("_pair_count").reset_index()
+            unique_pairs = (
+                signal.merge(pair_counts, on=pair_keys, how="left")
+                .loc[lambda x: x["_pair_count"] == 1, pair_keys + feature_cols]
+                .drop_duplicates(pair_keys)
+            )
+            fallback = exact.loc[missing, ["_row_id"] + pair_keys].merge(
+                unique_pairs,
+                on=pair_keys,
+                how="left",
+            )
+            fallback = fallback.set_index("_row_id")
+            for col in feature_cols:
+                exact.loc[missing, col] = exact.loc[missing, "_row_id"].map(fallback[col])
+
+        return (
+            exact.sort_values("_row_id", kind="mergesort")
+            .drop(columns=["_row_id", "_round_key"])
+            .reset_index(drop=True)
+        )
+
     years = range(int(df["year"].min()), int(df["year"].max()) + 1)
     print("Building enhanced Squiggle features...")
     enhanced = build_enhanced_squiggle_historical(years)
@@ -498,18 +574,10 @@ def _add_enhanced_squiggle(df: pd.DataFrame) -> pd.DataFrame:
         df["squiggle_model_spread"] = 0.1
         return df
 
-    # Deduplicate on (year, home_team, away_team) — average if multiple rounds match
-    enhanced_dedup = (
-        enhanced.groupby(["year", "home_team", "away_team"])
-        [["squiggle_top3_prob", "squiggle_model_spread"]]
-        .mean()
-        .reset_index()
-    )
-
-    df = df.merge(
-        enhanced_dedup,
-        on=["year", "home_team", "away_team"],
-        how="left",
+    df = _merge_with_round_fallback(
+        df,
+        enhanced,
+        ["squiggle_top3_prob", "squiggle_model_spread"],
     )
     df["squiggle_top3_prob"] = df["squiggle_top3_prob"].fillna(
         df.get("squiggle_prob_home", 0.5)

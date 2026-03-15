@@ -6,6 +6,8 @@
 
 We built an ensemble machine learning system to identify value bets in Australian Rules Football (AFL) markets. The system combines Elo ratings, Glicko-2 ratings, rolling performance statistics, weather data, and consensus model predictions, blended with bookmaker odds via a calibrated logit-space stacker. Over a 10-year walk-forward backtest (2015-2024), the strategy produced +8.6% ROI on 69 bets with a 68.1% win rate. However, the sample size is far too small for statistical significance, closing line value is negative (-0.011), and individual models fail to beat the market on log loss. We conclude that the results are consistent with variance rather than genuine edge, and publish the full system as a reference implementation.
 
+**Version note (v8, 2026-03-15)**: We tightened the historical Squiggle methodology to remove a small leakage source in the "top models" feature and to match Squiggle predictions by round where possible. On rerun, the ensemble still slightly beats market log loss on the 2023-2024 holdout (`0.5902` vs `0.5929`, delta `+0.0027`), but walk-forward betting results softened from `+8.6%` ROI to `+6.5%` ROI on the same 69 bets (`+$169`, bankroll `+$16.9%`). The rest of the write-up below reflects the earlier v7 snapshot unless noted here.
+
 ## 1. Introduction
 
 Sports betting markets are widely considered semi-efficient: bookmaker odds incorporate substantial information and are difficult to beat systematically. The AFL, with ~200 matches per season and a well-developed betting market in Australia, presents an interesting test case. The question is simple: can a quantitative model, trained on 16 years of historical data and enriched with external signals, find exploitable inefficiencies?
@@ -280,6 +282,7 @@ This project went through several iterations, each attempting to improve on the 
 5. **v5** -- Favourite-only strategy with tight filters. Flipped from -$181 to +$110.
 6. **v6** -- Betfair Exchange integration (live only), enhanced Squiggle features, Glicko-2 ratings, context features, neural net with team embeddings. Marginal improvement.
 7. **v7** -- Systematic pruning. Removed neural net, dropped 11 zero-importance features (47 -> 36). Tested and rejected 12 new features (conversion rates, line movement, extended team stats, ladder position, ground dimensions). Less is more: ROI improved from +4.6% to +8.6%.
+8. **v8** -- Rigor pass. Fixed historical enhanced-Squiggle leakage by ranking top models using only prior rounds, and tightened Squiggle joins to use round-level matching before falling back to pair-level matching. Predictive lift remained small (`+0.0027` log-loss delta vs market on 2023-2024), while walk-forward ROI dropped from `+8.6%` to `+6.5%`, which is less flattering but more credible.
 
 The biggest single improvement came not from better modelling but from better strategy (v5). The second biggest came from removing features and models (v7).
 

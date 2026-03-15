@@ -17,6 +17,112 @@ SQUIGGLE_API = "https://api.squiggle.com.au/"
 SQUIGGLE_CACHE = os.path.join(DATA_DIR, "squiggle_cache")
 HEADERS = {"User-Agent": "afl-tipping-bot/1.0 (github.com/plwp/afl-betting)"}
 STANDINGS_CACHE_TTL = 86400  # 24 hours
+FINAL_ROUND_MAP = {
+    "Elimination Final": "25",
+    "Qualifying Final": "25",
+    "Semi Final": "26",
+    "Preliminary Final": "27",
+    "Grand Final": "28",
+}
+
+
+def _normalize_round_id(value) -> str:
+    """Normalize round identifiers across data sources."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text in FINAL_ROUND_MAP:
+        return FINAL_ROUND_MAP[text]
+    try:
+        return str(int(float(text)))
+    except ValueError:
+        return text
+
+
+def _prepare_tips_df(tips: list, require_correct: bool = False) -> pd.DataFrame:
+    """Normalize Squiggle tips into a typed DataFrame."""
+    if not tips:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(tips)
+    required = {"hconfidence", "hteam", "ateam", "source"}
+    if require_correct:
+        required.add("correct")
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    from config import TEAM_NAME_MAP
+
+    df = df.copy()
+    df["hconfidence"] = pd.to_numeric(df["hconfidence"], errors="coerce")
+    df = df.dropna(subset=["hconfidence"])
+    if require_correct:
+        df["correct"] = pd.to_numeric(df["correct"], errors="coerce")
+        df = df.dropna(subset=["correct"])
+
+    exclude = {"Aggregate", "Punters"}
+    df = df[~df["source"].isin(exclude)]
+    df["home_team"] = df["hteam"].map(lambda n: TEAM_NAME_MAP.get(n, n))
+    df["away_team"] = df["ateam"].map(lambda n: TEAM_NAME_MAP.get(n, n))
+    df["prob"] = df["hconfidence"] / 100.0
+    df["round_num"] = df.get("round", "").map(_normalize_round_id)
+    return df
+
+
+def _top_models_from_df(df: pd.DataFrame, n: int = 3) -> list[str]:
+    """Rank models by accuracy using only rows already observed."""
+    if df.empty or "correct" not in df.columns:
+        return []
+    accuracy = df.groupby("source")["correct"].mean().sort_values(ascending=False)
+    return list(accuracy.head(n).index)
+
+
+def _build_enhanced_round_features(df: pd.DataFrame, top_n: int = 3) -> pd.DataFrame:
+    """Build leakage-safe enhanced Squiggle features round by round."""
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["round_sort"] = pd.to_numeric(df["round_num"], errors="coerce")
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    round_keys = (
+        df[["round_num", "round_sort"] + (["date"] if "date" in df.columns else [])]
+        .drop_duplicates("round_num")
+        .sort_values(
+            ["round_sort"] + (["date"] if "date" in df.columns else []),
+            kind="mergesort",
+            na_position="last",
+        )["round_num"]
+        .tolist()
+    )
+
+    rows = []
+    history = df.iloc[0:0].copy()
+    for round_num in round_keys:
+        current = df[df["round_num"] == round_num].copy()
+        top_models = _top_models_from_df(history, n=top_n)
+
+        for (home, away), group in current.groupby(["home_team", "away_team"], sort=False):
+            if top_models:
+                top_group = group[group["source"].isin(top_models)]
+                top_prob = float(top_group["prob"].mean()) if not top_group.empty else float(group["prob"].mean())
+            else:
+                top_prob = float(group["prob"].mean())
+
+            rows.append({
+                "year": int(group["year"].iloc[0]),
+                "round_num": round_num,
+                "home_team": home,
+                "away_team": away,
+                "squiggle_top3_prob": top_prob,
+                "squiggle_model_spread": float(group["prob"].std()) if len(group) > 1 else 0.0,
+            })
+
+        history = pd.concat([history, current], ignore_index=True)
+
+    return pd.DataFrame(rows)
 
 
 def _cache_path(year: int) -> str:
@@ -58,36 +164,17 @@ def build_squiggle_consensus(years: range) -> pd.DataFrame:
     if not all_tips:
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_tips)
-
-    # Squiggle tips have: hteam, ateam, year, round, confidence, hconfidence, tip, source
-    # 'hconfidence' is the home team win probability (0-100) from each model
-    # We want the average across all models for each match
-
-    if "hconfidence" not in df.columns or "hteam" not in df.columns:
+    df = _prepare_tips_df(all_tips, require_correct=False)
+    if df.empty:
         return pd.DataFrame()
-
-    # Some models don't provide hconfidence
-    df = df.dropna(subset=["hconfidence"])
-    df["hconfidence"] = pd.to_numeric(df["hconfidence"], errors="coerce")
-    df = df.dropna(subset=["hconfidence"])
-
-    # Normalize team names
-    from config import TEAM_NAME_MAP
-    df["home_team"] = df["hteam"].map(lambda n: TEAM_NAME_MAP.get(n, n))
-    df["away_team"] = df["ateam"].map(lambda n: TEAM_NAME_MAP.get(n, n))
 
     # Average across all models per match
     consensus = (
-        df.groupby(["year", "round", "home_team", "away_team"])["hconfidence"]
+        df.groupby(["year", "round_num", "home_team", "away_team"])["hconfidence"]
         .mean()
         .reset_index()
     )
     consensus["squiggle_prob_home"] = consensus["hconfidence"] / 100.0
-    consensus = consensus.rename(columns={"round": "round_num"})
-
-    # Convert round_num to match our format
-    consensus["round_num"] = consensus["round_num"].astype(str)
     consensus["year"] = consensus["year"].astype(int)
 
     return consensus[["year", "round_num", "home_team", "away_team", "squiggle_prob_home"]]
@@ -130,23 +217,23 @@ def get_top_models(year: int, n: int = 3) -> list:
     Computes accuracy from the tips data (correct column) rather than
     relying on a separate standings endpoint.
     """
+    return get_top_models_up_to_round(year, n=n)
+
+
+def get_top_models_up_to_round(year: int, n: int = 3, max_round=None) -> list:
+    """Return top models using only completed rounds before max_round."""
     tips = fetch_squiggle_tips(year)
-    if not tips:
+    df = _prepare_tips_df(tips, require_correct=True)
+    if df.empty:
         return []
 
-    df = pd.DataFrame(tips)
-    if "correct" not in df.columns or "source" not in df.columns:
-        return []
+    if max_round is not None:
+        max_round_key = _normalize_round_id(max_round)
+        current_round_sort = pd.to_numeric(pd.Series([max_round_key]), errors="coerce").iloc[0]
+        df["round_sort"] = pd.to_numeric(df["round_num"], errors="coerce")
+        df = df[df["round_sort"] < current_round_sort]
 
-    df["correct"] = pd.to_numeric(df["correct"], errors="coerce")
-    df = df.dropna(subset=["correct"])
-
-    # Exclude meta-sources like 'Aggregate'
-    exclude = {"Aggregate", "Punters"}
-    df = df[~df["source"].isin(exclude)]
-
-    accuracy = df.groupby("source")["correct"].mean().sort_values(ascending=False)
-    return list(accuracy.head(n).index)
+    return _top_models_from_df(df, n=n)
 
 
 def fetch_current_round_tips(year: int, round_num: int) -> list:
@@ -183,22 +270,15 @@ def get_enhanced_squiggle_data(year: int, round_num: int) -> dict:
     """
     from config import TEAM_NAME_MAP
 
-    top_models = get_top_models(year)
+    top_models = get_top_models_up_to_round(year, max_round=round_num)
     tips = fetch_current_round_tips(year, round_num)
 
     if not tips:
         return {}
 
-    df = pd.DataFrame(tips)
-    if "hconfidence" not in df.columns or "hteam" not in df.columns:
+    df = _prepare_tips_df(tips, require_correct=False)
+    if df.empty:
         return {}
-
-    df = df.dropna(subset=["hconfidence"])
-    df["hconfidence"] = pd.to_numeric(df["hconfidence"], errors="coerce")
-    df = df.dropna(subset=["hconfidence"])
-    df["home_team"] = df["hteam"].map(lambda n: TEAM_NAME_MAP.get(n, n))
-    df["away_team"] = df["ateam"].map(lambda n: TEAM_NAME_MAP.get(n, n))
-    df["prob"] = df["hconfidence"] / 100.0
 
     result = {}
     for (home, away), group in df.groupby(["home_team", "away_team"]):
@@ -232,55 +312,19 @@ def build_enhanced_squiggle_historical(years: range) -> pd.DataFrame:
     Returns DataFrame with columns:
       year, round_num, home_team, away_team, squiggle_top3_prob, squiggle_model_spread
     """
-    from config import TEAM_NAME_MAP
-
-    exclude = {"Aggregate", "Punters"}
     all_rows = []
 
     for year in years:
         tips = fetch_squiggle_tips(year)
-        if not tips:
+        year_df = _prepare_tips_df(tips, require_correct=True)
+        if year_df.empty:
             continue
 
-        df = pd.DataFrame(tips)
-        if "hconfidence" not in df.columns or "hteam" not in df.columns:
-            continue
-
-        # Identify top 3 models for this year
-        top_models = get_top_models(year)
-
-        # Clean up
-        df = df[~df["source"].isin(exclude)]
-        df = df.dropna(subset=["hconfidence"])
-        df["hconfidence"] = pd.to_numeric(df["hconfidence"], errors="coerce")
-        df = df.dropna(subset=["hconfidence"])
-        df["home_team"] = df["hteam"].map(lambda n: TEAM_NAME_MAP.get(n, n))
-        df["away_team"] = df["ateam"].map(lambda n: TEAM_NAME_MAP.get(n, n))
-        df["prob"] = df["hconfidence"] / 100.0
-
-        for (home, away, rnd), group in df.groupby(["home_team", "away_team", "round"]):
-            # Top 3 model average
-            if top_models:
-                top3 = group[group["source"].isin(top_models)]
-                top3_prob = float(top3["prob"].mean()) if not top3.empty else float(group["prob"].mean())
-            else:
-                top3_prob = float(group["prob"].mean())
-
-            # Model disagreement
-            model_spread = float(group["prob"].std()) if len(group) > 1 else 0.0
-
-            all_rows.append({
-                "year": int(year),
-                "round_num": str(rnd),
-                "home_team": home,
-                "away_team": away,
-                "squiggle_top3_prob": top3_prob,
-                "squiggle_model_spread": model_spread,
-            })
+        all_rows.append(_build_enhanced_round_features(year_df, top_n=3))
 
     if not all_rows:
         return pd.DataFrame()
 
-    result = pd.DataFrame(all_rows)
+    result = pd.concat(all_rows, ignore_index=True)
     print(f"  Enhanced Squiggle: {len(result)} matches across {len(years)} years")
     return result
