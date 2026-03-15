@@ -196,6 +196,14 @@ def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     long["scoring_ewma"] = grouped["team_score"].transform(
         lambda s: s.shift(1).ewm(span=10, adjust=False, min_periods=1).mean()
     )
+    long["scoring_vol"] = grouped["team_score"].transform(
+        lambda s: s.shift(1).rolling(10, min_periods=3).std()
+    )
+    long["margin_trend"] = grouped["team_margin"].transform(
+        lambda s: s.shift(1).rolling(5, min_periods=3).apply(
+            lambda x: np.polyfit(range(len(x)), x, 1)[0], raw=True
+        )
+    )
     long["venue_exp"] = grouped["venue"].transform(
         lambda s: s.groupby(s).cumcount().astype(float)
     )
@@ -206,19 +214,23 @@ def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     df["h2h_home_win_pct"] = _build_h2h_feature(df)
 
     home_feats = long[long["is_home"] == 1].set_index("match_idx")[
-        ["form_5", "win_pct_10", "margin_ewma", "scoring_ewma", "venue_exp", "rest_days"]
+        ["form_5", "win_pct_10", "margin_ewma", "scoring_ewma", "scoring_vol",
+         "margin_trend", "venue_exp", "rest_days"]
     ]
     home_feats.columns = [
         "form_home_5", "win_pct_home_10", "margin_ewma_home",
-        "scoring_ewma_home", "venue_exp_home", "rest_days_home",
+        "scoring_ewma_home", "scoring_vol_home", "margin_trend_home",
+        "venue_exp_home", "rest_days_home",
     ]
 
     away_feats = long[long["is_home"] == 0].set_index("match_idx")[
-        ["form_5", "win_pct_10", "margin_ewma", "scoring_ewma", "venue_exp", "rest_days"]
+        ["form_5", "win_pct_10", "margin_ewma", "scoring_ewma", "scoring_vol",
+         "margin_trend", "venue_exp", "rest_days"]
     ]
     away_feats.columns = [
         "form_away_5", "win_pct_away_10", "margin_ewma_away",
-        "scoring_ewma_away", "venue_exp_away", "rest_days_away",
+        "scoring_ewma_away", "scoring_vol_away", "margin_trend_away",
+        "venue_exp_away", "rest_days_away",
     ]
 
     df = df.join(home_feats).join(away_feats)
@@ -230,7 +242,22 @@ def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     df["rest_diff"] = df["rest_days_home"] - df["rest_days_away"]
     df["margin_ewma_diff"] = df["margin_ewma_home"] - df["margin_ewma_away"]
     df["scoring_ewma_diff"] = df["scoring_ewma_home"] - df["scoring_ewma_away"]
+    df["scoring_vol_diff"] = df["scoring_vol_home"] - df["scoring_vol_away"]
+    df["form_accel_home"] = df["form_home_5"] - df["win_pct_home_10"]
+    df["form_accel_away"] = df["form_away_5"] - df["win_pct_away_10"]
+    df["form_accel_diff"] = df["form_accel_home"] - df["form_accel_away"]
+    df["margin_trend_diff"] = df["margin_trend_home"] - df["margin_trend_away"]
     df["market_elo_delta"] = df["market_prob_home"] - df["elo_prob"]
+
+    # Odds drift: sharp money movement between open and close
+    if "odds_home_close" in df.columns:
+        df["odds_drift_implied"] = (1.0 / df["odds_home_close"]) - (1.0 / df["odds_home"])
+    else:
+        df["odds_drift_implied"] = 0.0
+    if "home_line_close" in df.columns and "home_line_open" in df.columns:
+        df["line_move"] = df["home_line_close"] - df["home_line_open"]
+    else:
+        df["line_move"] = 0.0
 
     # Travel / state features
     df["is_home_state"] = df.apply(
@@ -264,7 +291,12 @@ def build_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
         "h2h_home_win_pct": 0.5,
         "margin_ewma_home": 0.0, "margin_ewma_away": 0.0, "margin_ewma_diff": 0.0,
         "scoring_ewma_home": 80.0, "scoring_ewma_away": 80.0, "scoring_ewma_diff": 0.0,
+        "scoring_vol_home": 20.0, "scoring_vol_away": 20.0, "scoring_vol_diff": 0.0,
+        "form_accel_home": 0.0, "form_accel_away": 0.0, "form_accel_diff": 0.0,
+        "margin_trend_home": 0.0, "margin_trend_away": 0.0, "margin_trend_diff": 0.0,
         "market_elo_delta": 0.0,
+        "odds_drift_implied": 0.0,
+        "line_move": 0.0,
         "travel_hours_home": 0.0, "travel_hours_away": 0.0,
         "is_home_state": 1,
         "glicko_prob": 0.5, "glicko_uncertainty": 350.0,
@@ -314,6 +346,7 @@ def _team_snapshot(df: pd.DataFrame, team: str, venue: str = None, match_date=No
         return {
             "elo": ELO_INIT, "form_5": 0.5, "win_pct_10": 0.5,
             "margin_ewma": 0.0, "scoring_ewma": 80.0,
+            "scoring_vol": 20.0, "margin_trend": 0.0,
             "venue_exp": 0.0, "rest_days": 30.0,
         }
 
@@ -326,12 +359,23 @@ def _team_snapshot(df: pd.DataFrame, team: str, venue: str = None, match_date=No
     )
     venue_exp = float((history["venue"] == venue).sum()) if venue else 0.0
 
+    recent_scores = scores.tail(10)
+    scoring_vol = float(recent_scores.std()) if len(recent_scores) >= 3 else 20.0
+
+    recent_margins = margins.tail(5)
+    if len(recent_margins) >= 3:
+        margin_trend = float(np.polyfit(range(len(recent_margins)), recent_margins, 1)[0])
+    else:
+        margin_trend = 0.0
+
     return {
         "elo": float(history["elo_post"].iloc[-1]),
         "form_5": float(wins.tail(5).mean()),
         "win_pct_10": float(wins.tail(10).mean()),
         "margin_ewma": float(margins.ewm(span=10, adjust=False).mean().iloc[-1]),
         "scoring_ewma": float(scores.ewm(span=10, adjust=False).mean().iloc[-1]),
+        "scoring_vol": scoring_vol,
+        "margin_trend": margin_trend,
         "venue_exp": venue_exp,
         "rest_days": rest_days,
     }
@@ -422,6 +466,15 @@ def build_current_match_features(
         "scoring_ewma_home": home["scoring_ewma"],
         "scoring_ewma_away": away["scoring_ewma"],
         "scoring_ewma_diff": home["scoring_ewma"] - away["scoring_ewma"],
+        "scoring_vol_home": home["scoring_vol"],
+        "scoring_vol_away": away["scoring_vol"],
+        "scoring_vol_diff": home["scoring_vol"] - away["scoring_vol"],
+        "form_accel_home": home["form_5"] - home["win_pct_10"],
+        "form_accel_away": away["form_5"] - away["win_pct_10"],
+        "form_accel_diff": (home["form_5"] - home["win_pct_10"]) - (away["form_5"] - away["win_pct_10"]),
+        "margin_trend_home": home["margin_trend"],
+        "margin_trend_away": away["margin_trend"],
+        "margin_trend_diff": home["margin_trend"] - away["margin_trend"],
         # Glicko-2 defaults for live mode
         "glicko_prob": elo_prob,
         "glicko_uncertainty": 200.0,
@@ -431,6 +484,9 @@ def build_current_match_features(
         "rivalry_intensity": 40.0,
         "home_venue_pct": 0.5,
         "team_h2h_margin_ewma": 0.0,
+        # Odds drift defaults (not available for future matches)
+        "odds_drift_implied": 0.0,
+        "line_move": 0.0,
         # Defaults for features not available in live mode
         "rain_mm": 0.0,
         "wind_speed": 0.0,
@@ -458,52 +514,61 @@ def _add_weather_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _add_squiggle_consensus(df: pd.DataFrame) -> pd.DataFrame:
-    """Add Squiggle model consensus predictions."""
-    from squiggle import build_squiggle_consensus, _normalize_round_id
+def _merge_with_round_fallback(
+    base_df: pd.DataFrame,
+    signal_df: pd.DataFrame,
+    feature_cols: list[str],
+) -> pd.DataFrame:
+    """Merge signal features onto base using (year, home, away, round), with pair fallback.
 
-    def _merge_with_round_fallback(
-        base_df: pd.DataFrame,
-        signal_df: pd.DataFrame,
-        feature_cols: list[str],
-    ) -> pd.DataFrame:
-        base = base_df.copy()
-        base["_row_id"] = np.arange(len(base))
-        base["_round_key"] = base["round_num"].map(_normalize_round_id)
+    Tries exact round-level match first. For unmatched rows, falls back to
+    (year, home, away) pair matching only when the pair is unique in signal_df
+    (i.e. no rematches that season).
+    """
+    from squiggle import _normalize_round_id
 
-        signal = signal_df.copy()
-        signal["_round_key"] = signal["round_num"].map(_normalize_round_id)
-        exact_keys = ["year", "home_team", "away_team", "_round_key"]
-        pair_keys = ["year", "home_team", "away_team"]
+    base = base_df.copy()
+    base["_row_id"] = np.arange(len(base))
+    base["_round_key"] = base["round_num"].map(_normalize_round_id)
 
-        exact = base.merge(
-            signal[exact_keys + feature_cols].drop_duplicates(exact_keys),
-            on=exact_keys,
+    signal = signal_df.copy()
+    signal["_round_key"] = signal["round_num"].map(_normalize_round_id)
+    exact_keys = ["year", "home_team", "away_team", "_round_key"]
+    pair_keys = ["year", "home_team", "away_team"]
+
+    exact = base.merge(
+        signal[exact_keys + feature_cols].drop_duplicates(exact_keys),
+        on=exact_keys,
+        how="left",
+    )
+
+    missing = exact[feature_cols[0]].isna()
+    if missing.any():
+        pair_counts = signal.groupby(pair_keys).size().rename("_pair_count").reset_index()
+        unique_pairs = (
+            signal.merge(pair_counts, on=pair_keys, how="left")
+            .loc[lambda x: x["_pair_count"] == 1, pair_keys + feature_cols]
+            .drop_duplicates(pair_keys)
+        )
+        fallback = exact.loc[missing, ["_row_id"] + pair_keys].merge(
+            unique_pairs,
+            on=pair_keys,
             how="left",
         )
+        fallback = fallback.set_index("_row_id")
+        for col in feature_cols:
+            exact.loc[missing, col] = exact.loc[missing, "_row_id"].map(fallback[col])
 
-        missing = exact[feature_cols[0]].isna()
-        if missing.any():
-            pair_counts = signal.groupby(pair_keys).size().rename("_pair_count").reset_index()
-            unique_pairs = (
-                signal.merge(pair_counts, on=pair_keys, how="left")
-                .loc[lambda x: x["_pair_count"] == 1, pair_keys + feature_cols]
-                .drop_duplicates(pair_keys)
-            )
-            fallback = exact.loc[missing, ["_row_id"] + pair_keys].merge(
-                unique_pairs,
-                on=pair_keys,
-                how="left",
-            )
-            fallback = fallback.set_index("_row_id")
-            for col in feature_cols:
-                exact.loc[missing, col] = exact.loc[missing, "_row_id"].map(fallback[col])
+    return (
+        exact.sort_values("_row_id", kind="mergesort")
+        .drop(columns=["_row_id", "_round_key"])
+        .reset_index(drop=True)
+    )
 
-        return (
-            exact.sort_values("_row_id", kind="mergesort")
-            .drop(columns=["_row_id", "_round_key"])
-            .reset_index(drop=True)
-        )
+
+def _add_squiggle_consensus(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Squiggle model consensus predictions."""
+    from squiggle import build_squiggle_consensus
 
     years = range(int(df["year"].min()), int(df["year"].max()) + 1)
     print("Fetching Squiggle predictions...")
@@ -520,50 +585,7 @@ def _add_squiggle_consensus(df: pd.DataFrame) -> pd.DataFrame:
 
 def _add_enhanced_squiggle(df: pd.DataFrame) -> pd.DataFrame:
     """Add enhanced Squiggle features: top-3 model prob and model spread."""
-    from squiggle import build_enhanced_squiggle_historical, _normalize_round_id
-
-    def _merge_with_round_fallback(
-        base_df: pd.DataFrame,
-        signal_df: pd.DataFrame,
-        feature_cols: list[str],
-    ) -> pd.DataFrame:
-        base = base_df.copy()
-        base["_row_id"] = np.arange(len(base))
-        base["_round_key"] = base["round_num"].map(_normalize_round_id)
-
-        signal = signal_df.copy()
-        signal["_round_key"] = signal["round_num"].map(_normalize_round_id)
-        exact_keys = ["year", "home_team", "away_team", "_round_key"]
-        pair_keys = ["year", "home_team", "away_team"]
-
-        exact = base.merge(
-            signal[exact_keys + feature_cols].drop_duplicates(exact_keys),
-            on=exact_keys,
-            how="left",
-        )
-
-        missing = exact[feature_cols[0]].isna()
-        if missing.any():
-            pair_counts = signal.groupby(pair_keys).size().rename("_pair_count").reset_index()
-            unique_pairs = (
-                signal.merge(pair_counts, on=pair_keys, how="left")
-                .loc[lambda x: x["_pair_count"] == 1, pair_keys + feature_cols]
-                .drop_duplicates(pair_keys)
-            )
-            fallback = exact.loc[missing, ["_row_id"] + pair_keys].merge(
-                unique_pairs,
-                on=pair_keys,
-                how="left",
-            )
-            fallback = fallback.set_index("_row_id")
-            for col in feature_cols:
-                exact.loc[missing, col] = exact.loc[missing, "_row_id"].map(fallback[col])
-
-        return (
-            exact.sort_values("_row_id", kind="mergesort")
-            .drop(columns=["_row_id", "_round_key"])
-            .reset_index(drop=True)
-        )
+    from squiggle import build_enhanced_squiggle_historical
 
     years = range(int(df["year"].min()), int(df["year"].max()) + 1)
     print("Building enhanced Squiggle features...")

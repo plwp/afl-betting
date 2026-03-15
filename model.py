@@ -21,6 +21,7 @@ from config import (
     FEATURE_COLS,
     FEATURE_PATH,
     MODEL_DIR,
+    SAMPLE_WEIGHT_HALF_LIFE,
     STACKER_C_VALUES,
     TEST_END,
     TEST_START,
@@ -47,6 +48,12 @@ def temporal_split(df: pd.DataFrame):
     val = df[(df["year"] >= VAL_START) & (df["year"] <= VAL_END)].copy()
     test = df[(df["year"] >= TEST_START) & (df["year"] <= TEST_END)].copy()
     return train, val, test
+
+
+def _compute_sample_weights(years: np.ndarray, max_year: int) -> np.ndarray:
+    """Exponential time-decay weights: recent seasons matter more."""
+    age = max_year - years.astype(float)
+    return np.exp(-np.log(2) * age / SAMPLE_WEIGHT_HALF_LIFE)
 
 
 def evaluate(y_true, y_prob, label: str, market_prob=None):
@@ -168,6 +175,7 @@ class EnsemblePredictor:
 def _tune_logreg(
     X_train: pd.DataFrame, y_train: np.ndarray,
     X_val: pd.DataFrame, y_val: np.ndarray,
+    sample_weight: np.ndarray = None,
 ) -> tuple[StandardScaler, LogisticRegression, dict]:
     scaler = StandardScaler()
     X_train_sc = scaler.fit_transform(X_train)
@@ -180,7 +188,7 @@ def _tune_logreg(
 
     for c_value in candidates:
         model = LogisticRegression(max_iter=5000, C=c_value, solver="lbfgs")
-        model.fit(X_train_sc, y_train)
+        model.fit(X_train_sc, y_train, sample_weight=sample_weight)
         val_prob = model.predict_proba(X_val_sc)[:, 1]
         score = log_loss(y_val, _clip_probs(val_prob))
         if score < best_score:
@@ -194,6 +202,7 @@ def _tune_logreg(
 def _tune_lgbm(
     X_train: pd.DataFrame, y_train: np.ndarray,
     X_val: pd.DataFrame, y_val: np.ndarray,
+    sample_weight: np.ndarray = None,
 ) -> tuple[lgb.LGBMClassifier, dict]:
     candidates = [
         {"n_estimators": 400, "learning_rate": 0.03, "max_depth": 4,
@@ -216,6 +225,7 @@ def _tune_lgbm(
         )
         model.fit(
             X_train, y_train,
+            sample_weight=sample_weight,
             eval_set=[(X_val, y_val)],
             eval_metric="binary_logloss",
             callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
@@ -235,6 +245,7 @@ def _tune_lgbm(
 def _tune_xgboost(
     X_train: pd.DataFrame, y_train: np.ndarray,
     X_val: pd.DataFrame, y_val: np.ndarray,
+    sample_weight: np.ndarray = None,
 ) -> tuple[xgb.XGBClassifier, dict]:
     candidates = [
         {"n_estimators": 400, "learning_rate": 0.03, "max_depth": 4,
@@ -256,7 +267,8 @@ def _tune_xgboost(
             objective="binary:logistic", eval_metric="logloss",
             random_state=42, verbosity=0, early_stopping_rounds=50, **params,
         )
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        model.fit(X_train, y_train, sample_weight=sample_weight,
+                  eval_set=[(X_val, y_val)], verbose=False)
         val_prob = model.predict_proba(X_val)[:, 1]
         score = log_loss(y_val, _clip_probs(val_prob))
         if score < best_score:
@@ -273,6 +285,7 @@ def _tune_margin_regressor(
     X_train: pd.DataFrame, y_margin_train: np.ndarray,
     X_val: pd.DataFrame, y_margin_val: np.ndarray,
     y_val_binary: np.ndarray,
+    sample_weight: np.ndarray = None,
 ) -> tuple[xgb.XGBRegressor, float, dict]:
     candidates = [
         {"n_estimators": 400, "learning_rate": 0.03, "max_depth": 4,
@@ -295,7 +308,8 @@ def _tune_margin_regressor(
             objective="reg:squarederror", eval_metric="rmse",
             random_state=42, verbosity=0, early_stopping_rounds=50, **params,
         )
-        model.fit(X_train, y_margin_train, eval_set=[(X_val, y_margin_val)], verbose=False)
+        model.fit(X_train, y_margin_train, sample_weight=sample_weight,
+                  eval_set=[(X_val, y_margin_val)], verbose=False)
         val_pred = model.predict(X_val)
         residuals = y_margin_val - val_pred
         residual_std = float(np.std(residuals))
@@ -375,11 +389,14 @@ def fit_model_bundle(
     y_cal = calibration_df["home_win"].to_numpy()
     y_margin_cal = calibration_df["margin"].to_numpy()
 
-    scaler, logreg, logreg_meta = _tune_logreg(X_train, y_train, X_cal, y_cal)
-    lgb_model, lgb_meta = _tune_lgbm(X_train, y_train, X_cal, y_cal)
-    xgb_model, xgb_meta = _tune_xgboost(X_train, y_train, X_cal, y_cal)
+    max_year = int(train_df["year"].max())
+    sw = _compute_sample_weights(train_df["year"].to_numpy(), max_year)
+
+    scaler, logreg, logreg_meta = _tune_logreg(X_train, y_train, X_cal, y_cal, sample_weight=sw)
+    lgb_model, lgb_meta = _tune_lgbm(X_train, y_train, X_cal, y_cal, sample_weight=sw)
+    xgb_model, xgb_meta = _tune_xgboost(X_train, y_train, X_cal, y_cal, sample_weight=sw)
     margin_model, margin_residual_std, margin_meta = _tune_margin_regressor(
-        X_train, y_margin_train, X_cal, y_margin_cal, y_cal,
+        X_train, y_margin_train, X_cal, y_margin_cal, y_cal, sample_weight=sw,
     )
 
     # Calibration probabilities

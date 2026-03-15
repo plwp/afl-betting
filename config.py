@@ -72,13 +72,15 @@ TEST_END = 2024
 KELLY_FRACTION = 0.25
 MAX_BET_FRACTION = 0.05
 MIN_STAKE = 5.0
-EDGE_THRESHOLD = 0.05
+EDGE_THRESHOLD = 0.05  # default / favourite edge threshold
+EDGE_THRESHOLD_DOG = 0.05  # dogs also need 5% edge, plus situational filters
 MAX_ODDS = 3.0
 MIN_MODEL_PROB = 0.55
 FAVOURITE_ONLY = True
 ARB_STAKE_FRACTION = 0.05  # fraction of bankroll to deploy on an arb
 INITIAL_BANKROLL = 1000.0
 STACKER_C_VALUES = [0.01, 0.02, 0.05, 0.1]
+SAMPLE_WEIGHT_HALF_LIFE = 3.0  # years; older samples decay exponentially
 
 # --- Glicko-2 Parameters ---
 GLICKO2_INIT_RATING = 1500.0
@@ -182,6 +184,10 @@ FEATURE_COLS = [
     "season_round",
     "margin_ewma_home", "margin_ewma_away", "margin_ewma_diff",
     "scoring_ewma_home", "scoring_ewma_away", "scoring_ewma_diff",
+    # Volatility / momentum
+    "scoring_vol_home", "scoring_vol_away", "scoring_vol_diff",
+    "form_accel_home", "form_accel_away", "form_accel_diff",
+    "margin_trend_home", "margin_trend_away", "margin_trend_diff",
     # Weather
     "rain_mm", "wind_speed",
     # Squiggle consensus

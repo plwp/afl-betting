@@ -58,6 +58,10 @@ def download_odds_data() -> pd.DataFrame:
         "Away Odds": "odds_away",
         "Home Odds Close": "odds_home_close",
         "Away Odds Close": "odds_away_close",
+        "Home Line Open": "home_line_open",
+        "Home Line Close": "home_line_close",
+        "Home Line Odds Close": "home_line_odds_close",
+        "Away Line Odds Close": "away_line_odds_close",
         "Play Off Game?": "is_final",
     }
     for old, new in odds_cols.items():

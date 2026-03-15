@@ -8,12 +8,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from config import (
-    EDGE_THRESHOLD, FEATURE_COLS, INITIAL_BANKROLL, MAX_ODDS, MIN_MODEL_PROB,
-    MIN_STAKE,
+    EDGE_THRESHOLD, EDGE_THRESHOLD_DOG, FEATURE_COLS, INITIAL_BANKROLL,
+    MAX_ODDS, MIN_MODEL_PROB, MIN_STAKE,
 )
 from model import fit_model_bundle, _clip_probs, _tune_logreg, _tune_lgbm
 from sizing import edge, kelly_stake
-from strategy import FavouriteOnlyStrategy
+from strategy import BettingStrategy
 
 
 def _select_bets(row: pd.Series, prob_home: float, bankroll: float, edge_threshold: float):
@@ -86,24 +86,22 @@ def walk_forward_backtest(
     end_year: int = 2024,
     initial_bankroll: float = INITIAL_BANKROLL,
     edge_threshold: float = EDGE_THRESHOLD,
+    edge_threshold_dog: float = EDGE_THRESHOLD_DOG,
     use_stacker: bool = True,
     max_odds: float = MAX_ODDS,
     min_model_prob: float = MIN_MODEL_PROB,
-    favourite_only: bool = True,
 ) -> dict:
     """Walk-forward backtest with yearly retraining, single bet per match, daily bankroll lock."""
     bankroll = float(initial_bankroll)
     bet_log = []
     bankroll_history = [(df[df["year"] == start_year]["date"].min(), bankroll)]
 
-    if favourite_only:
-        strategy = FavouriteOnlyStrategy(
-            edge_threshold=edge_threshold,
-            max_odds=max_odds,
-            min_model_prob=min_model_prob,
-        )
-    else:
-        strategy = None
+    strategy = BettingStrategy(
+        edge_threshold_fav=edge_threshold,
+        edge_threshold_dog=edge_threshold_dog,
+        max_odds=max_odds,
+        min_model_prob=min_model_prob,
+    )
 
     for year in range(start_year, end_year + 1):
         train_data = df[df["year"] <= year - 3].copy()
@@ -119,8 +117,13 @@ def walk_forward_backtest(
             probs = predictor.predict_proba(
                 test_data[FEATURE_COLS],
             )[:, 1]
+            # Margin predictions for line betting
+            margin_preds = predictor.margin_model.predict(test_data[FEATURE_COLS])
+            margin_std = predictor.margin_residual_std
         else:
             probs, lgb_meta = _fixed_weight_probs(train_data, cal_data, test_data)
+            margin_preds = None
+            margin_std = None
 
         print(
             f"  {year}: trained with {len(train_data)} train / {len(cal_data)} cal rows"
@@ -145,10 +148,11 @@ def walk_forward_backtest(
                 pending_pnl = 0.0
             current_date = row["date"]
 
-            if strategy is not None:
-                candidates = strategy.select_bets(row, float(probs[idx]), daily_start_bankroll)
-            else:
-                candidates = _select_bets(row, float(probs[idx]), daily_start_bankroll, edge_threshold)
+            m_pred = float(margin_preds[idx]) if margin_preds is not None else None
+            candidates = strategy.select_bets(
+                row, float(probs[idx]), daily_start_bankroll,
+                margin_pred=m_pred, margin_std=margin_std,
+            )
             if not candidates:
                 continue
 

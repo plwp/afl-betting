@@ -8,8 +8,8 @@ from data_ingest import run as ingest
 from features import build_feature_matrix
 from backtest import walk_forward_backtest, plot_bankroll
 from config import (
-    MERGED_PATH, FEATURE_PATH, MODEL_DIR, EDGE_THRESHOLD, MAX_ODDS,
-    MIN_MODEL_PROB, FAVOURITE_ONLY,
+    MERGED_PATH, FEATURE_PATH, MODEL_DIR, EDGE_THRESHOLD, EDGE_THRESHOLD_DOG,
+    MAX_ODDS, MIN_MODEL_PROB,
 )
 
 
@@ -18,7 +18,9 @@ def main():
     parser.add_argument("--start", type=int, default=2015, help="Start year")
     parser.add_argument("--end", type=int, default=2024, help="End year")
     parser.add_argument("--edge", type=float, default=EDGE_THRESHOLD,
-                        help="Minimum edge threshold")
+                        help="Minimum edge threshold for favourites")
+    parser.add_argument("--edge-dog", type=float, default=EDGE_THRESHOLD_DOG,
+                        help="Minimum edge threshold for underdogs")
     parser.add_argument("--stacker", action="store_true", default=True,
                         help="Use logit stacker (default: True)")
     parser.add_argument("--no-stacker", dest="stacker", action="store_false",
@@ -27,10 +29,6 @@ def main():
                         help="Maximum odds to bet (default: 3.0)")
     parser.add_argument("--min-prob", type=float, default=MIN_MODEL_PROB,
                         help="Minimum model probability (default: 0.55)")
-    parser.add_argument("--fav-only", action="store_true", default=FAVOURITE_ONLY,
-                        help="Favourite-only strategy (default: True)")
-    parser.add_argument("--no-fav-only", dest="fav_only", action="store_false",
-                        help="Disable favourite-only strategy")
     args = parser.parse_args()
 
     # Step 1: Ingest data if needed
@@ -45,18 +43,17 @@ def main():
 
     # Step 3: Run backtest
     mode = "stacker" if args.stacker else "fixed-weight 70/15/15"
-    strat = "fav-only" if args.fav_only else "all-sides"
-    print(f"\n=== Walk-Forward Backtest ({mode}, {strat}, edge={args.edge:.0%}, max_odds={args.max_odds}, min_prob={args.min_prob:.0%}) ===")
+    print(f"\n=== Walk-Forward Backtest ({mode}, fav_edge={args.edge:.0%}, dog_edge={args.edge_dog:.0%}, max_odds={args.max_odds}, min_prob={args.min_prob:.0%}) ===")
     df = pd.read_parquet(FEATURE_PATH)
     results = walk_forward_backtest(
         df,
         start_year=args.start,
         end_year=args.end,
         edge_threshold=args.edge,
+        edge_threshold_dog=args.edge_dog,
         use_stacker=args.stacker,
         max_odds=args.max_odds,
         min_model_prob=args.min_prob,
-        favourite_only=args.fav_only,
     )
 
     # Step 4: Plot bankroll curve
