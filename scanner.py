@@ -15,6 +15,7 @@ from config import (
     ARB_STAKE_FRACTION, MIN_STAKE,
 )
 from sizing import kelly_stake, edge
+from strategy import DOG_MIN_FORM, DOG_MAX_SCORING_GAP
 
 
 def _cache_path(params: dict) -> str:
@@ -140,19 +141,32 @@ def _arb_stakes(odds_home: float, odds_away: float, bankroll: float,
     return stake_home, stake_away, profit
 
 
+def _is_hot_dog(home_team: str, away_team: str, season_form: dict) -> bool:
+    """Check if a home underdog passes the hot-dog filter."""
+    if not season_form:
+        return False
+    home_data = season_form.get(home_team)
+    away_data = season_form.get(away_team)
+    if not home_data or not away_data:
+        return False
+    scoring_gap = away_data["scoring_ewma"] - home_data["scoring_ewma"]
+    return home_data["form_5"] >= DOG_MIN_FORM and scoring_gap <= DOG_MAX_SCORING_GAP
+
+
 def scan_value_bets(odds_df: pd.DataFrame,
                     model_probs: dict,
                     bankroll: float,
                     edge_threshold: float = EDGE_THRESHOLD,
                     max_odds: float = MAX_ODDS,
                     min_model_prob: float = MIN_MODEL_PROB,
-                    favourite_only: bool = FAVOURITE_ONLY) -> pd.DataFrame:
+                    favourite_only: bool = FAVOURITE_ONLY,
+                    season_form: dict = None) -> pd.DataFrame:
     """Find +EV bets and cross-bookie arbitrages.
 
     Arbs bypass all filters (favourite-only, odds cap, model prob).
-    For non-arb EV bets, when favourite_only=True only bets the side where
-    model prob >= min_model_prob, market agrees (implied prob > 0.5),
-    and odds <= max_odds.
+    For non-arb EV bets, when favourite_only=True only bets the favourite side
+    UNLESS the home underdog passes the hot-dog filter (hot form + close scoring).
+    season_form: dict from squiggle.fetch_season_form() for hot-dog checks.
     """
     value_bets = []
 
@@ -206,51 +220,42 @@ def scan_value_bets(odds_df: pd.DataFrame,
         implied_away = 1 / odds_a if odds_a > 0 else 0
         candidates = []
 
-        if odds_h > 0:
-            skip = (favourite_only
-                    and (prob_home < min_model_prob
-                         or implied_home <= 0.5
-                         or odds_h > max_odds))
-            if not skip:
-                e = edge(prob_home, odds_h)
-                if e > edge_threshold:
-                    stake = kelly_stake(prob_home, odds_h, bankroll)
-                    if stake > 0:
-                        candidates.append({
-                            "match": match_label,
-                            "side": row["home_team"],
-                            "model_prob": prob_home,
-                            "implied_prob": implied_home,
-                            "best_odds": odds_h,
-                            "bookmaker": row["best_home_bookie"],
-                            "edge": e,
-                            "kelly_stake": stake,
-                            "commence": row["commence_time"],
-                            "is_arb": False,
-                        })
+        for side_team, prob, implied, odds_val, bookie_col in [
+            (row["home_team"], prob_home, implied_home, odds_h, "best_home_bookie"),
+            (row["away_team"], prob_away, implied_away, odds_a, "best_away_bookie"),
+        ]:
+            if odds_val <= 0:
+                continue
+            is_fav = implied > 0.5
 
-        if odds_a > 0:
-            skip = (favourite_only
-                    and (prob_away < min_model_prob
-                         or implied_away <= 0.5
-                         or odds_a > max_odds))
-            if not skip:
-                e = edge(prob_away, odds_a)
-                if e > edge_threshold:
-                    stake = kelly_stake(prob_away, odds_a, bankroll)
-                    if stake > 0:
-                        candidates.append({
-                            "match": match_label,
-                            "side": row["away_team"],
-                            "model_prob": prob_away,
-                            "implied_prob": implied_away,
-                            "best_odds": odds_a,
-                            "bookmaker": row["best_away_bookie"],
-                            "edge": e,
-                            "kelly_stake": stake,
-                            "commence": row["commence_time"],
-                            "is_arb": False,
-                        })
+            if favourite_only:
+                if is_fav:
+                    if prob < min_model_prob or odds_val > max_odds:
+                        continue
+                else:
+                    # Underdog: apply hot-dog filter (home dogs only)
+                    is_home = (side_team == row["home_team"])
+                    if not is_home:
+                        continue
+                    if not _is_hot_dog(side_team, key[1], season_form):
+                        continue
+
+            e = edge(prob, odds_val)
+            if e > edge_threshold:
+                stake = kelly_stake(prob, odds_val, bankroll)
+                if stake > 0:
+                    candidates.append({
+                        "match": match_label,
+                        "side": side_team,
+                        "model_prob": prob,
+                        "implied_prob": implied,
+                        "best_odds": odds_val,
+                        "bookmaker": row[bookie_col],
+                        "edge": e,
+                        "kelly_stake": stake,
+                        "commence": row["commence_time"],
+                        "is_arb": False,
+                    })
 
         if candidates:
             value_bets.append(max(candidates, key=lambda b: (b["edge"], b["model_prob"])))

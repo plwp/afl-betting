@@ -303,6 +303,73 @@ def get_enhanced_squiggle_data(year: int, round_num: int) -> dict:
     return result
 
 
+def fetch_season_form(year: int) -> dict:
+    """Fetch completed results for a season and compute per-team form + scoring.
+
+    Returns dict keyed by team name with:
+      - form_5: win rate over last 5 games
+      - scoring_ewma: exponentially weighted scoring average (alpha=0.3)
+    """
+    from config import TEAM_NAME_MAP
+
+    cache_file = os.path.join(SQUIGGLE_CACHE, f"results_{year}.json")
+    os.makedirs(SQUIGGLE_CACHE, exist_ok=True)
+
+    # Cache for 1 hour (results change on game day)
+    if os.path.exists(cache_file):
+        mtime = os.path.getmtime(cache_file)
+        if time.time() - mtime < 3600:
+            with open(cache_file) as f:
+                games = json.load(f)
+        else:
+            games = None
+    else:
+        games = None
+
+    if games is None:
+        print(f"  Fetching {year} results from Squiggle...")
+        params = {"q": "games", "year": year, "complete": 100}
+        resp = requests.get(SQUIGGLE_API, params=params, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        games = resp.json().get("games", [])
+        with open(cache_file, "w") as f:
+            json.dump(games, f)
+        time.sleep(1)
+
+    if not games:
+        return {}
+
+    # Build per-team history from completed games
+    team_history = {}  # team -> list of (won, score)
+    for g in sorted(games, key=lambda x: x.get("date", "")):
+        ht = TEAM_NAME_MAP.get(g.get("hteam", ""), g.get("hteam", ""))
+        at = TEAM_NAME_MAP.get(g.get("ateam", ""), g.get("ateam", ""))
+        hs, as_ = g.get("hscore", 0), g.get("ascore", 0)
+        if hs is None or as_ is None:
+            continue
+        team_history.setdefault(ht, []).append({"won": hs > as_, "score": hs})
+        team_history.setdefault(at, []).append({"won": as_ > hs, "score": as_})
+
+    # Compute form and scoring EWMA
+    result = {}
+    alpha = 0.3
+    for team, history in team_history.items():
+        recent = history[-5:] if len(history) >= 5 else history
+        form_5 = sum(1 for r in recent if r["won"]) / len(recent) if recent else 0.5
+
+        # EWMA scoring
+        ewma = history[0]["score"] if history else 80.0
+        for r in history[1:]:
+            ewma = alpha * r["score"] + (1 - alpha) * ewma
+
+        result[team] = {"form_5": form_5, "scoring_ewma": ewma}
+
+    if result:
+        print(f"  Season form: {len(result)} teams, {sum(len(v) for v in team_history.values())} results")
+
+    return result
+
+
 def build_enhanced_squiggle_historical(years: range) -> pd.DataFrame:
     """Build enhanced Squiggle features for historical data.
 

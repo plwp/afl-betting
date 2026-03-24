@@ -19,7 +19,7 @@ from scanner import fetch_odds, parse_odds, scan_value_bets
 from model import EnsemblePredictor  # noqa: F401 — needed for pickle
 from tracker import BetTracker
 from betfair import get_betfair_data
-from squiggle import get_enhanced_squiggle_data
+from squiggle import get_enhanced_squiggle_data, fetch_season_form
 
 
 def main():
@@ -115,11 +115,14 @@ def main():
         prob = predictor.predict_proba(X)[0, 1]
         model_probs[(row["home_team"], row["away_team"])] = float(prob)
 
+    # Fetch season form for hot-dog filter
+    season_form = fetch_season_form(current_year)
+
     # Scan for value
     value_bets = scan_value_bets(
         odds_df, model_probs, args.bankroll, args.edge,
         max_odds=args.max_odds, min_model_prob=args.min_prob,
-        favourite_only=args.fav_only,
+        favourite_only=args.fav_only, season_form=season_form,
     )
 
     if value_bets.empty:
