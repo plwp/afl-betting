@@ -11,7 +11,7 @@ MATCH_CSV_URL = (
     "/main/data/matches/matches_{year}.csv"
 )
 ODDS_XLSX_URL = "https://www.aussportsbetting.com/historical_data/afl.xlsx"
-MATCH_YEARS = range(2009, 2025)
+MATCH_YEARS = range(2009, 2026)
 
 # --- Paths ---
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")

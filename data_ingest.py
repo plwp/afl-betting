@@ -32,6 +32,7 @@ def download_match_data() -> pd.DataFrame:
     matches["away_team"] = matches["team_2_team_name"].map(normalize_team)
     matches["date"] = pd.to_datetime(matches["date"].str.strip(), format="mixed").dt.normalize()
     matches["year"] = matches["year"].astype(int)
+    matches["round_num"] = matches["round_num"].astype(str)
 
     keep = [
         "date", "year", "round_num", "venue",
